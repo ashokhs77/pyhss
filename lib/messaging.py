@@ -137,7 +137,7 @@ class RedisMessaging:
         """
         try:
             key = self.handlePrefix(key=key, usePrefix=usePrefix, prefixHostname=prefixHostname, prefixServiceName=prefixServiceName)
-            message =  self.redisClient.blmpop(0, 1, key, direction='RIGHT', count=count)
+            message =  self.redisClient.blmpop(0, 1, key, direction='LEFT', count=count)
             return message
         except Exception as e:
             print(traceback.format_exc())

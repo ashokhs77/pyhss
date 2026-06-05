@@ -1150,14 +1150,19 @@ class Diameter:
                         if not time.time() >= startTimer + timeout:
                             # no sessionId supplied -> match by response type and sender and timestamp
                             if sessionId is None:
-                                queuedMessages = self.redisMessaging.getList(key=f"diameter-inbound", usePrefix=True, prefixHostname=self.hostname, prefixServiceName='diameter')
-                                self.logTool.log(service='HSS', level='debug', message=f"[diameter.py] [awaitDiameterRequestAndResponse] [{requestType}] queuedMessages(NoSessionId): {queuedMessages}", redisClient=self.redisMessaging)
+                                queuedMessages = (
+                                    self.redisMessaging.getList(key=f"diameter-inbound-history", usePrefix=True, prefixHostname=self.hostname, prefixServiceName='diameter') +
+                                    self.redisMessaging.getList(key=f"diameter-inbound", usePrefix=True, prefixHostname=self.hostname, prefixServiceName='diameter')
+                                )
+                                self.logTool.log(service='HSS', level='debug', message=f"[diameter.py] [awaitDiameterRequestAndResponse] [{requestType}] queuedMessages(NoSessionId/history+live): {queuedMessages}", redisClient=self.redisMessaging)
                                 for queuedMessage in queuedMessages:
                                     queuedMessage = json.loads(queuedMessage)
                                     clientAddress = queuedMessage.get('SenderIp', None)
                                     clientPort = queuedMessage.get('SenderPort', None)
-                                    if clientAddress != peerIp or clientPort != peerPort:
+                                    if clientAddress != peerIp:
                                         continue
+                                    # TCP Diameter responses can be recorded with the negotiated socket port.
+                                    # Match by peer host plus Session-ID/E2E/HBH instead of requiring peerPort.
                                     messageReceiveTime = queuedMessage.get('InitialReceiveTimestamp', None)
                                     if messageReceiveTime and float(messageReceiveTime) <= sendTime:
                                         continue
@@ -1187,14 +1192,19 @@ class Diameter:
                                         return messageHex
                                 time.sleep(0.01)
                             else:
-                                queuedMessages = self.redisMessaging.getList(key=f"diameter-inbound", usePrefix=True, prefixHostname=self.hostname, prefixServiceName='diameter')
-                                self.logTool.log(service='HSS', level='debug', message=f"[diameter.py] [awaitDiameterRequestAndResponse] [{requestType}] queuedMessages({sessionId}): {queuedMessages} responseType: {responseType}", redisClient=self.redisMessaging)
+                                queuedMessages = (
+                                    self.redisMessaging.getList(key=f"diameter-inbound-history", usePrefix=True, prefixHostname=self.hostname, prefixServiceName='diameter') +
+                                    self.redisMessaging.getList(key=f"diameter-inbound", usePrefix=True, prefixHostname=self.hostname, prefixServiceName='diameter')
+                                )
+                                self.logTool.log(service='HSS', level='debug', message=f"[diameter.py] [awaitDiameterRequestAndResponse] [{requestType}] queuedMessages({sessionId}/history+live): {queuedMessages} responseType: {responseType}", redisClient=self.redisMessaging)
                                 for queuedMessage in queuedMessages:
                                     queuedMessage = json.loads(queuedMessage)
                                     clientAddress = queuedMessage.get('SenderIp', None)
                                     clientPort = queuedMessage.get('SenderPort', None)
-                                    if clientAddress != peerIp or clientPort != peerPort:
+                                    if clientAddress != peerIp:
                                         continue
+                                    # TCP Diameter responses can be recorded with the negotiated socket port.
+                                    # The exact response is still correlated below by Session-ID/E2E/HBH.
                                     messageReceiveTime = queuedMessage.get('InitialReceiveTimestamp', None)
                                     if messageReceiveTime and float(messageReceiveTime) <= sendTime:
                                         continue
@@ -3632,6 +3642,7 @@ class Diameter:
                 ueIp = str(self.hex_to_ip(ueIp))
             except Exception as e:
                 ueIp = None
+            aarFramedIp = ueIp
 
             """
             Determine if the AAR for the IP belongs to an inbound roaming emergency subscriber.
@@ -3816,6 +3827,13 @@ class Diameter:
                                 self.logTool.log(service='HSS', level='debug', message=f"[diameter.py] [Answer_16777236_265] [AAA] Getting Serving APN for subscriberId: {subscriberId} and apnId: {apnId}", redisClient=self.redisMessaging)
                                 if remoteServingApn:
                                     servingApn = remoteServingApn
+                                elif ipServingApn:
+                                    # Prefer the APN session that owns the Framed-IP-Address in the Rx AAR.
+                                    # Real IMS UEs use the IMS APN address (10.46.x.x here); using the default
+                                    # internet APN Gx session installs QCI-1/QCI-2 rules on the wrong bearer.
+                                    servingApn = ipServingApn
+                                    apnId = servingApn.get('apn', apnId)
+                                    self.logTool.log(service='HSS', level='info', message=f"[diameter.py] [Answer_16777236_265] [AAA] Using Serving APN matched by Rx Framed-IP {ueIp}: apnId={apnId}", redisClient=self.redisMessaging)
                                 else:
                                     servingApn = self.database.Get_Serving_APN(subscriber_id=subscriberId, apn_id=apnId)
                                     # Fallback: If no serving_apn for IMS APN, try default/internet APN.
@@ -3836,8 +3854,13 @@ class Diameter:
                                 servingPgwRealm = servingApn.get('serving_pgw_realm', None)
                                 pcrfSessionId = servingApn.get('pcrf_session_id', None)
     
-                            if not ueIp:
-                                ueIp = servingApn.get('subscriber_routing', None)
+                            rxFramedIp = aarFramedIp
+                            selectedServingApnIp = servingApn.get('subscriber_routing', None) if servingApn else None
+                            if selectedServingApnIp and ueIp != selectedServingApnIp:
+                                self.logTool.log(service='HSS', level='info', message=f"[diameter.py] [Answer_16777236_265] [AAA] Rx Framed-IP {ueIp} differs from selected Gx Serving APN IP {selectedServingApnIp}; using Serving APN IP for RAR", redisClient=self.redisMessaging)
+                                ueIp = selectedServingApnIp
+                            elif not ueIp:
+                                ueIp = selectedServingApnIp
     
                             if (int(mediaType, 16) == 0):
                                 #Audio
@@ -3890,6 +3913,9 @@ class Diameter:
                                         for suppliedTft in suppliedTfts:
                                             tftDirection = None
                                             decodedTft = bytes.fromhex(suppliedTft).decode('ascii')
+                                            if selectedServingApnIp and rxFramedIp and selectedServingApnIp != rxFramedIp:
+                                                decodedTft = decodedTft.replace(rxFramedIp, selectedServingApnIp)
+                                                self.logTool.log(service='HSS', level='info', message=f"[diameter.py] [Answer_16777236_265] [AAA] Rewrote supplied TFT Framed-IP {rxFramedIp} to Serving APN IP {selectedServingApnIp}: {decodedTft}", redisClient=self.redisMessaging)
                                             self.logTool.log(service='HSS', level='debug', message=f"[diameter.py] [Answer_16777236_265] [AAA] Got TFT from PCSCF: {decodedTft}", redisClient=self.redisMessaging)
                                             if 'permit out' in decodedTft.lower():
                                                 tftDirection = 1
@@ -3910,7 +3936,7 @@ class Diameter:
                                             "tft_string": decodedTft
                                             }
 	                                        )
-                                        tftId += 1
+                                            tftId += 1
                             except Exception as e:
                                 self.logTool.log(service='HSS', level='error', message=f"[diameter.py] [Answer_16777236_265] [AAA] Error using TFTs from PCSCF: {traceback.format_exc()}", redisClient=self.redisMessaging)
                             if not suppliedTfts:
@@ -3926,7 +3952,8 @@ class Diameter:
 
                                     regexIpv4 = r"IN IP4 (\d*\.\d*\.\d*\.\d*)"
                                     regexIpv6 = r"IN IP6 ([0-9a-fA-F:]{3,39})"
-                                    regexRtp = r"m=audio (\d*)"
+                                    mediaLabel = "video" if int(mediaType, 16) == 1 else "audio"
+                                    regexRtp = rf"m={mediaLabel} (\d*)"
                                     regexRtcp = r"a=rtcp:(\d+)"                            
 
                                     sdpDownlink = None
@@ -4037,6 +4064,7 @@ class Diameter:
                                 self.database.Update_Emergency_Subscriber(subscriberIp=ueIp, subscriberData=updatedEmergencySubscriberData, imsi=imsi)
 
                             self.logTool.log(service='HSS', level='debug', message=f"[diameter.py] [Answer_16777236_265] [AAA] RAR Generated to be sent to serving PGW: {servingPgw} via peer {servingPgwPeer}", redisClient=self.redisMessaging)
+                            print(f"[diameter.py] [Answer_16777236_265] [AAA] Sending RAR mediaType={int(mediaType, 16)} qci={qci} ueIp={ueIp} pcrfSessionId={pcrfSessionId} rule={rule_name} tfts={completedTftList}", flush=True)
                             reAuthAnswer = self.awaitDiameterRequestAndResponse(
 	                                requestType='RAR',
 	                                hostname=servingPgwPeer,
@@ -4048,11 +4076,12 @@ class Diameter:
 	                        )
 
                             if not len(reAuthAnswer) > 0:
-	                            self.logTool.log(service='HSS', level='debug', message=f"[diameter.py] [Answer_16777236_265] [AAA] RAA Timeout: {reAuthAnswer}", redisClient=self.redisMessaging)
+	                            self.logTool.log(service='HSS', level='error', message=f"[diameter.py] [Answer_16777236_265] [AAA] RAA Timeout after RAR queued: rule={rule_name} ueIp={ueIp} answer={reAuthAnswer}", redisClient=self.redisMessaging)
 	                            assert()
                             
                             raaPacketVars, raaAvps = self.decode_diameter_packet(reAuthAnswer)
                             raaResultCode = int(self.get_avp_data(raaAvps, 268)[0], 16)
+                            print(f"[diameter.py] [Answer_16777236_265] [AAA] RAA result mediaType={int(mediaType, 16)} qci={qci} ueIp={ueIp} result={raaResultCode} rule={rule_name}", flush=True)
 
                             if raaResultCode == 2001:
 	                            rAAAResultCode = 2001
@@ -4092,10 +4121,12 @@ class Diameter:
                             else:
 	                            rAAAResultCode = 4001
 	                            self.logTool.log(service='HSS', level='info', message=f"[diameter.py] [Answer_16777236_265] [AAA] RAA returned Unauthorized, declining request", redisClient=self.redisMessaging)
+	                            print(f"[diameter.py] [Answer_16777236_265] [AAA] RAA unauthorized mediaType={int(mediaType, 16)} qci={qci} ueIp={ueIp} result={raaResultCode} rule={rule_name}", flush=True)
 
                         except Exception as e:
                             self.logTool.log(service='HSS', level='error', message=f"[diameter.py] [Answer_16777236_265] [AAA] Error processing RAR / RAA, declining request: {traceback.format_exc()}", redisClient=self.redisMessaging)
                             rAAAResultCode = 4001
+                            print(f"[diameter.py] [Answer_16777236_265] [AAA] RAR/RAA exception mediaType={int(mediaType, 16) if mediaType else 'unknown'} ueIp={ueIp}: {traceback.format_exc()}", flush=True)
                 except Exception as e:
                     self.logTool.log(service='HSS', level='error', message=f"[diameter.py] [Answer_16777236_265] [AAA] Error generating AAA Charging Rule: {traceback.format_exc()}", redisClient=self.redisMessaging)
                     rAAAResultCode = 4001
@@ -4468,10 +4499,10 @@ class Diameter:
             avp += self.generate_avp(264, 40, self.OriginHost)                                               #Origin Host
             avp += self.generate_avp(296, 40, self.OriginRealm)                                              #Origin Realm
             avp += self.generate_avp(268, 40, self.int_to_hex(2001, 4))
-            response = self.generate_diameter_packet("01", "40", 274, 16777236, packet_vars['hop-by-hop-identifier'], packet_vars['end-to-end-identifier'], avp)     #Generate Diameter packet
+            response = self.generate_diameter_packet("01", "40", 258, 16777238, packet_vars['hop-by-hop-identifier'], packet_vars['end-to-end-identifier'], avp)     #Generate Diameter packet
             return response
         except Exception as e:
-            self.logTool.log(service='HSS', level='error', message=f"[diameter.py] [Answer_16777236_274] [RAA] Error generating RAA: {traceback.format_exc()}", redisClient=self.redisMessaging)
+            self.logTool.log(service='HSS', level='error', message=f"[diameter.py] [Answer_16777238_258] [RAA] Error generating RAA: {traceback.format_exc()}", redisClient=self.redisMessaging)
 
     #3GPP S13 - ME-Identity-Check Answer
     def Answer_16777252_324(self, packet_vars, avps):
@@ -4523,16 +4554,17 @@ class Diameter:
             #Equipment-Status
             EquipmentStatus = self.database.Check_EIR(imsi=imsi, imei=imei)
             avp += self.generate_vendor_avp(1445, 'c0', 10415, self.int_to_hex(EquipmentStatus, 4))
-            self.redisMessaging.sendMetric(serviceName='diameter', metricName='prom_diam_eir_event_count',
-                                    metricType='counter', metricAction='inc', 
-                                    metricValue=1.0, 
-                                    metricLabels={
-                                                "response": EquipmentStatus},
-                                    metricHelp='Diameter EIR event related Counters',
-                                    metricExpiry=60,
-                                    usePrefix=True, 
-                                    prefixHostname=self.hostname, 
-                                    prefixServiceName='metric')
+            if config.get('prometheus', {}).get('enabled', False):
+                self.redisMessaging.sendMetric(serviceName='diameter', metricName='prom_diam_eir_event_count',
+                                        metricType='counter', metricAction='inc',
+                                        metricValue=1.0,
+                                        metricLabels={
+                                                    "response": EquipmentStatus},
+                                        metricHelp='Diameter EIR event related Counters',
+                                        metricExpiry=60,
+                                        usePrefix=True,
+                                        prefixHostname=self.hostname,
+                                        prefixServiceName='metric')
         except Exception as e:
             self.logTool.log(service='HSS', level='error', message=traceback.format_exc(), redisClient=self.redisMessaging)
 

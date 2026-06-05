@@ -271,10 +271,12 @@ class DiameterService:
         """
         batchInterval = 0.1
         inboundQueueName = f"diameter-inbound"
+        inboundHistoryQueueName = f"diameter-inbound-history"
         while True:
             try:
                 nextSendTime = time.time() + batchInterval
                 messageList = []
+                historyMessageList = []
                 while time.time() < nextSendTime:
                     try:
                         inboundData = await(asyncio.wait_for(self.sharedQueue.get(), timeout=nextSendTime - time.time()))
@@ -287,7 +289,9 @@ class DiameterService:
                                 await(self.logTool.logAsync(service='Diameter', level='info', message=f"[Diameter] [inboundDataWorker] [{coroutineUuid}] Validated peer: {inboundData.SenderIp} on port {inboundData.SenderPort}"))
 
                         await(self.logTool.logAsync(service='Diameter', level='debug', message=f"[Diameter] [inboundDataWorker] [{coroutineUuid}] Queueing to redis: {inboundData}"))
-                        messageList.append(inboundData.model_dump_json())
+                        inboundMessage = inboundData.model_dump_json()
+                        messageList.append(inboundMessage)
+                        historyMessageList.append(inboundMessage)
                         if self.benchmarking:
                             self.diameterRequests += 1
                     except asyncio.TimeoutError:
@@ -295,7 +299,12 @@ class DiameterService:
 
                 if messageList:
                     await self.redisReaderMessaging.sendBulkMessage(queue=inboundQueueName, messageList=messageList, queueExpiry=self.diameterRequestTimeout, usePrefix=True, prefixHostname=self.hostname, prefixServiceName='diameter')
+                    # Keep a short-lived, non-destructive copy for synchronous request/answer waiters.
+                    # hssService consumes diameter-inbound with BLMPOP, so waiters can otherwise miss
+                    # valid response packets such as Gx RAA before they can correlate by Session-ID/HBH/E2E.
+                    await self.redisReaderMessaging.sendBulkMessage(queue=inboundHistoryQueueName, messageList=historyMessageList, queueExpiry=max(self.diameterRequestTimeout, 10), usePrefix=True, prefixHostname=self.hostname, prefixServiceName='diameter')
                     messageList = []
+                    historyMessageList = []
 
             except Exception as e:
                 await(self.logTool.logAsync(service='Diameter', level='info', message=f"[Diameter] [inboundDataWorker] [{coroutineUuid}] Exception for inboundDataWorker, continuing.\n{e}"))
