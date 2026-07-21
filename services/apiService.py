@@ -64,6 +64,16 @@ diameterClient = Diameter(
 
 databaseClient = database.Database(logTool=logTool, redisMessaging=redisMessaging)
 
+def _valid_imsi(imsi):
+    """Narrow input check: True if imsi is a 14-15 digit numeric string (MCC+MNC+MSIN)."""
+    s = str(imsi) if imsi is not None else ''
+    return s.isdigit() and 14 <= len(s) <= 15
+
+def _valid_hex(val, length):
+    """Narrow input check: True if val is a hex string of exactly `length` characters."""
+    s = str(val) if val is not None else ''
+    return len(s) == length and all(c in '0123456789abcdefABCDEF' for c in s)
+
 apiService = Flask(__name__)
 
 APN = database.APN
@@ -565,7 +575,18 @@ class PyHSS_AUC(Resource):
     def put(self):
         '''Create new AUC'''
         try:
-            json_data = request.get_json(force=True)
+            try:
+                json_data = request.get_json(force=True)
+            except Exception:
+                return {'result': 'Failed', 'error': 'Malformed JSON body'}, 400
+            if not isinstance(json_data, dict):
+                return {'result': 'Failed', 'error': 'JSON body must be a JSON object'}, 400
+            # Narrow input validation: reject clearly-malformed values only; valid provisioning is unaffected.
+            if json_data.get('imsi') not in (None, '') and not _valid_imsi(json_data.get('imsi')):
+                return {'result': 'Failed', 'error': 'Invalid IMSI (must be 14-15 digits)'}, 400
+            for _k in ('ki', 'opc'):
+                if json_data.get(_k) not in (None, '') and not _valid_hex(json_data.get(_k), 32):
+                    return {'result': 'Failed', 'error': 'Invalid %s (must be 32 hex characters)' % _k}, 400
             args = parser.parse_args()
             operation_id = args.get('operation_id', None)
             data = databaseClient.CreateObj(AUC, json_data, False, operation_id)
@@ -1102,6 +1123,8 @@ class PyHSS_SUBSCRIBER_IMSI(Resource):
     def get(self, imsi):
         '''Get data for IMSI'''
         try:
+            if not _valid_imsi(imsi):
+                return {'result': 'Failed', 'error': 'Invalid IMSI format (must be 14-15 digits)'}, 400
             data = databaseClient.Get_Subscriber(imsi=imsi, get_attributes=True)
             return data, 200
         except Exception as E:
@@ -1237,7 +1260,14 @@ class PyHSS_IMS_SUBSCRIBER(Resource):
     def put(self):
         '''Create new IMS SUBSCRIBER'''
         try:
-            json_data = request.get_json(force=True)
+            try:
+                json_data = request.get_json(force=True)
+            except Exception:
+                return {'result': 'Failed', 'error': 'Malformed JSON body'}, 400
+            if not isinstance(json_data, dict):
+                return {'result': 'Failed', 'error': 'JSON body must be a JSON object'}, 400
+            if json_data.get('imsi') not in (None, '') and not _valid_imsi(json_data.get('imsi')):
+                return {'result': 'Failed', 'error': 'Invalid IMSI (must be 14-15 digits)'}, 400
             if 'msisdn' in json_data:
                 json_data['msisdn'] = json_data['msisdn'].replace('+', '')
             if 'msisdn_list' in json_data:

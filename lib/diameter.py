@@ -3781,6 +3781,59 @@ class Diameter:
                     # Extract all Media-Component-Description AVPs
                     media_components = self.get_avp_data(avps, 517)
 
+                    # --- Remove the GBR-Video bearer on a genuine video->audio downgrade ---
+                    # A video->audio switch sends a modification AAR that omits the video
+                    # Media-Component; the GBR-Video QCI-2 bearer must then be removed or the
+                    # strict MTK UE BYEs the call ~3 s later (issue 5/6, TS 29.214).
+                    # BUT an audio->video switch ALSO produces transient audio-only AARs
+                    # (before the audio+video state settles).  An earlier version removed on
+                    # every audio-only AAR and churned the just-installed video bearer
+                    # (2 AARs -> 40+ RARs, SMF rule_count:0) so A->V never got a video
+                    # bearer.  Distinguish by TIME (synchronous, no timer thread): only
+                    # remove the video rule if it has been installed longer than
+                    # VIDEO_STABLE_SECS (a real downgrade of a stable video), never when it
+                    # was just added (transient during an upgrade).
+                    try:
+                        VIDEO_STABLE_SECS = 5.0
+                        presentMediaTypes = set()
+                        for _mc in media_components:
+                            try:
+                                presentMediaTypes.add(int(self.get_avp_data(_mc, 520)[0], 16))
+                            except Exception:
+                                pass
+                        if len(presentMediaTypes) > 0 and 1 not in presentMediaTypes:
+                            _rxKey = f"rx_session:{sessionId}"
+                            _bindRaw = self.redisMessaging.getValue(key=_rxKey)
+                            if _bindRaw:
+                                _bind = json.loads(_bindRaw)
+                                _installedAt = _bind.get("video_installed_at")
+                                _rules = _bind.get("rules", [])
+                                _videoRules = [r for r in _rules if r.startswith("GBR-Video")]
+                                _ageOk = _installedAt is not None and (time.time() - _installedAt) > VIDEO_STABLE_SECS
+                                if _videoRules and _ageOk:
+                                    _keptRules = [r for r in _rules if not r.startswith("GBR-Video")]
+                                    for _rn in _videoRules:
+                                        self.logTool.log(service='HSS', level='info', message=f"[diameter.py] [Answer_16777236_265] [AAA] Video->audio downgrade: removing GBR-Video rule {_rn} (installed {round(time.time()-_installedAt,1)}s ago)", redisClient=self.redisMessaging)
+                                        try:
+                                            self.awaitDiameterRequestAndResponse(
+                                                requestType='RAR',
+                                                hostname=_bind.get('servingPgwPeer', '').split(';')[0],
+                                                sessionId=_bind.get('pcrfSessionId'),
+                                                servingPgw=_bind.get('servingPgw'),
+                                                servingRealm=_bind.get('servingPgwRealm'),
+                                                chargingRuleName=_rn,
+                                                chargingRuleAction='remove'
+                                            )
+                                        except Exception:
+                                            self.logTool.log(service='HSS', level='error', message=f"[diameter.py] [Answer_16777236_265] [AAA] Error removing video rule {_rn}: {traceback.format_exc()}", redisClient=self.redisMessaging)
+                                    _bind["rules"] = _keptRules
+                                    _bind.pop("video_installed_at", None)
+                                    self.redisMessaging.setValue(key=_rxKey, value=json.dumps(_bind), keyExpiry=7200)
+                                elif _videoRules and not _ageOk:
+                                    self.logTool.log(service='HSS', level='debug', message=f"[diameter.py] [Answer_16777236_265] [AAA] Audio-only AAR but video installed <{VIDEO_STABLE_SECS}s ago - transient (A->V upgrade), not removing", redisClient=self.redisMessaging)
+                    except Exception:
+                        self.logTool.log(service='HSS', level='error', message=f"[diameter.py] [Answer_16777236_265] [AAA] Error during video-downgrade cleanup: {traceback.format_exc()}", redisClient=self.redisMessaging)
+
                     # Iterate through each media component
                     for media_avp in media_components:
                         mediaType = self.get_avp_data(media_avp, 520)[0]
@@ -3897,6 +3950,25 @@ class Diameter:
                             except Exception as e:
                                 pass
 
+                            # 3GPP TS 29.213: when the RTCP flows are carried in the same PCC
+                            # rule (they are - the TFT includes the RTCP ports), the rule MBR
+                            # must be Max-Requested-Bandwidth + RS-Bandwidth + RR-Bandwidth so
+                            # the bearer fits RTP plus RTCP (e.g. 41000+512+1537=43049 for
+                            # AMR-WB).  Granting MBR=GBR=AS leaves the bearer 2049 bps short;
+                            # strict UE stacks (MTK VoLTE, e.g. Optimus) treat the reservation
+                            # as insufficient, never alert, and reject with 480 after the 183.
+                            # The Amarisoft PCF grants exactly AS+RS+RR, which works.
+                            mbrUlBandwidth = ulBandwidth
+                            mbrDlBandwidth = dlBandwidth
+                            try:
+                                avpRsBandwidth = int((self.get_avp_data(media_avp, 522)[0]), 16)
+                                avpRrBandwidth = int((self.get_avp_data(media_avp, 521)[0]), 16)
+                                mbrUlBandwidth = ulBandwidth + avpRsBandwidth + avpRrBandwidth
+                                mbrDlBandwidth = dlBandwidth + avpRsBandwidth + avpRrBandwidth
+                                self.logTool.log(service='HSS', level='debug', message=f"[diameter.py] [Answer_16777236_265] [AAA] MBR set to AS+RS+RR: UL {mbrUlBandwidth} DL {mbrDlBandwidth}", redisClient=self.redisMessaging)
+                            except Exception as e:
+                                pass
+
                             """
 	                        If the PCSCF supplies us TFT's ready to go, use those.
 	                        If not, compile our own.
@@ -3929,6 +4001,17 @@ class Diameter:
                                                 tftDirection = 2
                                                 self.logTool.log(service='HSS', level='debug', message=f"[diameter.py] [Answer_16777236_265] [AAA] Recompiled 'permit in' TFT to: {decodedTft}", redisClient=self.redisMessaging)
 
+                                            # 3GPP TS 24.008/24.301: a network-provided TFT may only carry
+                                            # local (UE-side) address/port components when the network has
+                                            # signalled "local address in TFT" support in PCO, which open5gs
+                                            # does not do.  Strict UE stacks (MTK VoLTE) then fail to bind the
+                                            # dedicated bearer to the media flow and reject the call with 480
+                                            # after the 183.  Strip the UE-side port so the packet filter only
+                                            # carries remote address/port/protocol (legal without the PCO flag).
+                                            decodedTftSplit = decodedTft.split(' ')
+                                            if len(decodedTftSplit) == 9 and decodedTftSplit[6] == 'to':
+                                                decodedTft = ' '.join(decodedTftSplit[:8])
+                                                self.logTool.log(service='HSS', level='debug', message=f"[diameter.py] [Answer_16777236_265] [AAA] Stripped UE-side port from TFT: {decodedTft}", redisClient=self.redisMessaging)
                                             completedTftList.append({
                                             "tft_group_id": 1,
                                             "direction": tftDirection,
@@ -3990,9 +4073,9 @@ class Diameter:
 	                                # Else, if all necessary variables are defined, use the correct SDP rule.
 	                                # The fallback rule will fail on some cheap handsets.
                                     if not sdpDownlinkIpv4 or not sdpDownlinkRtpPort or not sdpUplinkRtpPort:
-                                        tftString = f"permit out 17 from {ueIp}/32 1-65535 to any 1-65535"
+                                        tftString = f"permit out 17 from {ueIp}/32 1-65535 to any"
                                     else:
-                                        tftString = f"permit out 17 from {sdpDownlinkIpv4}/32 {sdpDownlinkRtpPorts} to {ueIp}/32 {sdpUplinkRtpPorts}"
+                                        tftString = f"permit out 17 from {sdpDownlinkIpv4}/32 {sdpDownlinkRtpPorts} to {ueIp}/32"
                                 
                                     completedTftList.append({
                                             "tft_group_id": 1,
@@ -4031,8 +4114,8 @@ class Diameter:
 	                        "charging_rule_id": charging_rule_id,
 	                        "qci": qci,
 	                        "arp_preemption_capability": arpPreemptionCapability,
-	                        "mbr_dl": dlBandwidth,
-	                        "mbr_ul": ulBandwidth,
+	                        "mbr_dl": mbrDlBandwidth,
+	                        "mbr_ul": mbrUlBandwidth,
 	                        "gbr_ul": ulBandwidth,
 	                        "precedence": precedence,
 	                        "arp_priority": arp_priority,
@@ -4063,6 +4146,16 @@ class Diameter:
                                 self.logTool.log(service='HSS', level='debug', message=f"[diameter.py] [Answer_16777236_265] [AAA] Updating Emergency Subscriber: {updatedEmergencySubscriberData}", redisClient=self.redisMessaging)
                                 self.database.Update_Emergency_Subscriber(subscriberIp=ueIp, subscriberData=updatedEmergencySubscriberData, imsi=imsi)
 
+                            # NOTE: A staggered/deferred-RAR scheme (defer each subsequent
+                            # media component's RAR by 2.5 s on a timer thread) was tried
+                            # here to dodge the eNB one-RRC-reconfiguration-at-a-time limit
+                            # on the first video call after attach.  It was REMOVED: firing
+                            # a bearer-install RAR 2.5 s later on a timer thread races the
+                            # call state (a mid-call switch or hangup may have moved on by
+                            # then), which caused UE detaches and one-way audio on audio<->
+                            # video switches.  RARs are sent immediately again.  The first-
+                            # video-after-attach eNB race must be solved another way (e.g.
+                            # eNB config, or a non-racy serialization) - not with a timer.
                             self.logTool.log(service='HSS', level='debug', message=f"[diameter.py] [Answer_16777236_265] [AAA] RAR Generated to be sent to serving PGW: {servingPgw} via peer {servingPgwPeer}", redisClient=self.redisMessaging)
                             print(f"[diameter.py] [Answer_16777236_265] [AAA] Sending RAR mediaType={int(mediaType, 16)} qci={qci} ueIp={ueIp} pcrfSessionId={pcrfSessionId} rule={rule_name} tfts={completedTftList}", flush=True)
                             reAuthAnswer = self.awaitDiameterRequestAndResponse(
@@ -4114,6 +4207,12 @@ class Diameter:
 	                                        "rule_name": rule_name,
 	                                        "rules": [rule_name],
 	                                    }
+	                                # Record the FIRST video (GBR-Video) rule install time so the
+	                                # audio<->video downgrade removal can tell a genuine video->audio
+	                                # switch (video stable for seconds) from a transient audio-only AAR
+	                                # during audio->video setup (video just installed).
+	                                if rule_name.startswith("GBR-Video") and not rx_session_binding.get("video_installed_at"):
+	                                    rx_session_binding["video_installed_at"] = time.time()
 	                                self.redisMessaging.setValue(key=rx_session_key, value=json.dumps(rx_session_binding), keyExpiry=7200)
 	                                self.logTool.log(service='HSS', level='info', message=f"[diameter.py] [Answer_16777236_265] [AAA] Stored Rx→Gx binding in Redis: key={rx_session_key} pcrfSessionId={pcrfSessionId} rules={rx_session_binding['rules']}", redisClient=self.redisMessaging)
 	                            except Exception as redis_ex:
