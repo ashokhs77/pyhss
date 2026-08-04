@@ -2033,161 +2033,264 @@ class Database:
 
     def Update_Serving_APN(self, imsi, apn, pcrf_session_id, serving_pgw, subscriber_routing, serving_pgw_realm=None, serving_pgw_peer=None, serving_pgw_timestamp=None, propagate=True):
         """
-        (1). A given UE should only ever have one IP per PDN connection.
-        (2). If a UE has no active PDN connections, it's treated as no longer being served and associated data is removed from the SERVING_APN object.
+        Atomically create, update, or delete the serving-APN state for one
+        subscriber/APN pair.
 
-        Given the above, the following logic is performed:
-
-          - The matching SUBSCRIBER object is found for the given imsi.
-            - If the SUBSCRIBER isn't found for the given IMSI, no further operations are performed.
-
-          - All SERVING_APNs are retrieved from the database.
-          - If the provided subscriber_routing(IP Address) matches any of the existing SERVING_APNs, the existing SERVING_APN is deleted (1).
-            - If the stored subscriber_routing is False or equivalent, the SERVING_APN is also deleted.
-            - This prevents duplicates from existing in the database, which may occur from UEs that detach where signalling was never provided.
-
-          - The SERVING_APN is updated with the provided information, or deleted if serving_pgw is None.
+        Gx and Rx are handled by different workers.  A serving-APN row must
+        therefore never be removed merely because an update-side effect (for
+        example a webhook) failed.  A CCR-T carrying an old Session-Id must
+        also not delete the row installed by a newer CCR-I.
         """
+        imsi = str(imsi)
+        requested_session_id = None if pcrf_session_id in (None, '', 'None') else str(pcrf_session_id)
+        now = datetime.datetime.now(tz=timezone.utc)
 
-        self.logTool.log(service='Database', level='debug', message="Called Update_Serving_APN() for imsi " + str(imsi) + " with APN " + str(apn), redisClient=self.redisMessaging)
-        self.logTool.log(service='Database', level='debug', message="PCRF Session ID " + str(pcrf_session_id) + " and serving PGW " + str(serving_pgw) + " and subscriber routing " + str(subscriber_routing), redisClient=self.redisMessaging)
-        self.logTool.log(service='Database', level='debug', message="Serving PGW Realm is: " + str(serving_pgw_realm) + " and peer is: " + str(serving_pgw_peer), redisClient=self.redisMessaging)
-        self.logTool.log(service='Database', level='debug', message="subscriber_routing: " + str(subscriber_routing), redisClient=self.redisMessaging)
-
-        """
-        The matching SUBSCRIBER object is found for the given imsi.
-        """
-        subscriber_details = self.Get_Subscriber(imsi=str(imsi))
-        if not subscriber_details:
-            self.logTool.log(service='Database', level='warning', message=f"Subscriber not found for IMSI: {imsi}", redisClient=self.redisMessaging)
-            return None
-        subscriber_id = subscriber_details['subscriber_id']
-
-        """
-        All SERVING_APNs are retrieved from the database.
-        """
-        try:
-            if serving_pgw and subscriber_routing:
-                servingApns = self.GetAll(SERVING_APN)
-                for servingApn in servingApns:
-                    """
-                    If the provided subscriber_routing(IP Address) matches any of the existing SERVING_APNs, the existing SERVING_APN is deleted (1).
-                    If the stored subscriber_routing is False or equivalent, the SERVING_APN is also deleted.
-                    """
-                    servingApnSubscriberRouting = servingApn.get('subscriber_routing', '')
-                    if (servingApnSubscriberRouting == subscriber_routing) or (not servingApnSubscriberRouting):
-                        servingApnId = servingApn.get('serving_apn_id', None)
-                        self.DeleteObj(SERVING_APN, int(servingApnId), True)
-        except Exception as e:
-            self.logTool.log(service='Database', level='warning', message=f"Error handling subscriber_routing duplicate check: {traceback.format_exc()}", redisClient=self.redisMessaging)
-
-        """
-        The SERVING_APN is updated with the provided information, or deleted if serving_pgw is None.
-        """
-        
-        #Split the APN list into a list
-        apn_list = subscriber_details['apn_list'].split(',')
-        self.logTool.log(service='Database', level='debug', message="Current APN List: " + str(apn_list), redisClient=self.redisMessaging)
-        #Remove the default APN from the list
-        try:
-            apn_list.remove(str(subscriber_details['default_apn']))
-        except:
-            self.logTool.log(service='Database', level='debug', message="Failed to remove default APN (" + str(subscriber_details['default_apn']) + " from APN List", redisClient=self.redisMessaging)
-            pass
-        #Add default APN in first position
-        apn_list.insert(0, str(subscriber_details['default_apn']))
-
-        #Get APN ID from APN
-        for apn_id in apn_list:
-            #Get each APN in List
-            apn_data = self.Get_APN(apn_id)
-            self.logTool.log(service='Database', level='debug', message=apn_data, redisClient=self.redisMessaging)
-            if str(apn_data['apn']).lower() == str(apn).lower():
-                self.logTool.log(service='Database', level='debug', message="Matched named APN " + str(apn_data['apn']) + " with APN ID " + str(apn_id), redisClient=self.redisMessaging)
-                break
-        self.logTool.log(service='Database', level='debug', message="APN ID is " + str(apn_id), redisClient=self.redisMessaging)
-
-        try:
-            if serving_pgw_timestamp != None and serving_pgw_timestamp != 'None':
-                serving_pgw_timestamp = datetime.strptime(serving_pgw_timestamp, '%Y-%m-%dT%H:%M:%SZ')
-                serving_pgw_timestamp = serving_pgw_timestamp.replace(tzinfo=timezone.utc)
-                serving_pgw_timestamp_string = serving_pgw_timestamp.strftime('%Y-%m-%dT%H:%M:%SZ')
-            else:
-                serving_pgw_timestamp = datetime.datetime.now(tz=timezone.utc)
-                serving_pgw_timestamp_string = serving_pgw_timestamp.strftime('%Y-%m-%dT%H:%M:%SZ')
-        except Exception as e:
-            serving_pgw_timestamp = datetime.datetime.now(tz=timezone.utc)
-            serving_pgw_timestamp_string = serving_pgw_timestamp.strftime('%Y-%m-%dT%H:%M:%SZ')
-        serving_pgw_realm = serving_pgw_realm
-        serving_pgw_peer = serving_pgw_peer
-
-        json_data = {
-            'apn' : apn_id,
-            'subscriber_id' : subscriber_id,
-            'pcrf_session_id' : str(pcrf_session_id),
-            'serving_pgw' : str(serving_pgw),
-            'serving_pgw_realm' : str(serving_pgw_realm),
-            'serving_pgw_peer' : str(serving_pgw_peer),
-            'serving_pgw_timestamp' : serving_pgw_timestamp,
-            'subscriber_routing' : str(subscriber_routing)
-        }
-
-        if serving_pgw is None:
+        if isinstance(serving_pgw_timestamp, datetime.datetime):
+            parsed_timestamp = serving_pgw_timestamp
+        elif serving_pgw_timestamp not in (None, '', 'None'):
             try:
-                ServingAPN = self.Get_Serving_APN(subscriber_id=subscriber_id, apn_id=apn_id)
-                self.logTool.log(service='Database', level='debug', message="Clearing PCRF session ID on serving_apn_id: " + str(ServingAPN['serving_apn_id']), redisClient=self.redisMessaging)
-                objectData = self.GetObj(SERVING_APN, ServingAPN['serving_apn_id'])
-                self.handleWebhook(objectData, 'DELETE')
-                self.DeleteObj(SERVING_APN, ServingAPN['serving_apn_id'], True)
-            except Exception as e:
-                self.logTool.log(service='Database', level='debug', message=f"Error when trying to delete serving_apn id: {apn_id}", redisClient=self.redisMessaging)
+                parsed_timestamp = datetime.datetime.strptime(
+                    str(serving_pgw_timestamp), '%Y-%m-%dT%H:%M:%SZ'
+                ).replace(tzinfo=timezone.utc)
+            except (TypeError, ValueError):
+                parsed_timestamp = now
         else:
-            try:
-            #Check if already a serving APN on record
-                self.logTool.log(service='Database', level='debug', message="Checking to see if subscriber id " + str(subscriber_id) + " already has an active PCRF profile on APN id " + str(apn_id), redisClient=self.redisMessaging)
-                ServingAPN = self.Get_Serving_APN(subscriber_id=subscriber_id, apn_id=apn_id)
-                self.logTool.log(service='Database', level='debug', message="Existing Serving APN ID on record, updating", redisClient=self.redisMessaging)
-                try:
-                    assert(type(serving_pgw) == str)
-                    assert(len(serving_pgw) > 0)
-                    assert("None" not in serving_pgw)
-                    
-                    self.UpdateObj(SERVING_APN, json_data, ServingAPN['serving_apn_id'], True)
-                    objectData = self.GetObj(SERVING_APN, ServingAPN['serving_apn_id'])
-                    self.handleWebhook(objectData, 'PATCH')
-                except:
-                    self.logTool.log(service='Database', level='debug', message="Clearing PCRF session ID on serving_apn_id: " + str(ServingAPN['serving_apn_id']), redisClient=self.redisMessaging)
-                    objectData = self.GetObj(SERVING_APN, ServingAPN['serving_apn_id'])
-                    self.handleWebhook(objectData, 'DELETE')
-                    self.DeleteObj(SERVING_APN, ServingAPN['serving_apn_id'], True)
-            except Exception as E:
-                self.logTool.log(service='Database', level='debug', message="Failed to update existing APN " + str(E), redisClient=self.redisMessaging)
-                #Create if does not exist
-                self.CreateObj(SERVING_APN, json_data, True)
-                ServingAPN = self.Get_Serving_APN(subscriber_id=subscriber_id, apn_id=apn_id)
-                objectData = self.GetObj(SERVING_APN, ServingAPN['serving_apn_id'])
-                self.handleWebhook(objectData, 'PUT')
+            parsed_timestamp = now
+        serving_pgw_timestamp_string = parsed_timestamp.strftime('%Y-%m-%dT%H:%M:%SZ')
 
-        #Sync state change with geored
-        if propagate == True:
-            try:
-                if 'PCRF' in config['geored']['sync_actions'] and self.georedEnabled == True:
-                    self.logTool.log(service='Database', level='debug', message="Propagate PCRF changes to Geographic PyHSS instances", redisClient=self.redisMessaging)
-                    self.handleGeored({"imsi": str(imsi),
-                                    'serving_apn' : apn,
-                                    'pcrf_session_id': pcrf_session_id,
-                                    'serving_pgw': serving_pgw,
-                                    'serving_pgw_realm': serving_pgw_realm,
-                                    'serving_pgw_peer': serving_pgw_peer,
-                                    'serving_pgw_timestamp': serving_pgw_timestamp_string,
-                                    'subscriber_routing': subscriber_routing
-                                    })
+        SessionLocal = sessionmaker(bind=self.engine, expire_on_commit=False)
+        session = SessionLocal()
+        webhook_events = []
+        changed = False
+        result_data = None
+
+        def serving_apn_to_dict(serving_apn):
+            return {
+                column.name: getattr(serving_apn, column.name)
+                for column in SERVING_APN.__table__.columns
+            }
+
+        try:
+            # The configured MySQL URL uses DBAPI autocommit.  Override it for
+            # this session so row locks and commit/rollback form a real atomic
+            # serving-state transaction.
+            if str(config['database']['db_type']).lower() in ('mysql', 'postgresql'):
+                session.connection(
+                    execution_options={'isolation_level': 'READ COMMITTED'}
+                )
+
+            # This row is the lock shared by all Gx updates for the subscriber.
+            subscriber = (
+                session.query(SUBSCRIBER)
+                .filter_by(imsi=imsi)
+                .with_for_update()
+                .one_or_none()
+            )
+            if subscriber is None:
+                session.rollback()
+                self.logTool.log(
+                    service='Database',
+                    level='warning',
+                    message=f"[SERVING_APN_STATE] action=SUBSCRIBER_NOT_FOUND imsi={imsi} apn={apn}",
+                    redisClient=self.redisMessaging
+                )
+                return None
+
+            # Preserve the configured APN preference order, while validating
+            # that the named APN is actually allowed for this subscriber.
+            allowed_apn_ids = [str(subscriber.default_apn)]
+            for candidate in str(subscriber.apn_list).split(','):
+                candidate = candidate.strip()
+                if candidate and candidate not in allowed_apn_ids:
+                    allowed_apn_ids.append(candidate)
+
+            apn_id = None
+            for candidate in allowed_apn_ids:
+                apn_row = session.query(APN).filter_by(apn_id=int(candidate)).one_or_none()
+                if apn_row is not None and str(apn_row.apn).lower() == str(apn).lower():
+                    apn_id = apn_row.apn_id
+                    break
+            if apn_id is None:
+                raise ValueError(f"APN {apn} is not configured for IMSI {imsi}")
+
+            existing_rows = (
+                session.query(SERVING_APN)
+                .filter_by(subscriber_id=subscriber.subscriber_id, apn=apn_id)
+                .order_by(SERVING_APN.serving_apn_id)
+                .with_for_update()
+                .all()
+            )
+
+            if serving_pgw is None:
+                # A network CCR-T includes its Session-Id.  Only that exact
+                # session may be removed.  A None Session-Id remains available
+                # for the existing administrative "clear all" path.
+                if requested_session_id is None:
+                    rows_to_delete = existing_rows
                 else:
-                    self.logTool.log(service='Database', level='debug', message="Config does not allow sync of PCRF events", redisClient=self.redisMessaging)
-            except Exception as E:
-                self.logTool.log(service='Database', level='debug', message="Nothing synced to Geographic PyHSS instances for event PCRF", redisClient=self.redisMessaging)
+                    rows_to_delete = [
+                        row for row in existing_rows
+                        if str(row.pcrf_session_id) == requested_session_id
+                    ]
 
-            return
+                if not rows_to_delete:
+                    active_session_ids = [
+                        str(row.pcrf_session_id) for row in existing_rows
+                    ]
+                    session.rollback()
+                    self.logTool.log(
+                        service='Database',
+                        level='info',
+                        message=(
+                            f"[SERVING_APN_STATE] action=STALE_DELETE_IGNORED "
+                            f"imsi={imsi} apn={apn} requested_session={requested_session_id} "
+                            f"active_sessions={active_session_ids}"
+                        ),
+                        redisClient=self.redisMessaging
+                    )
+                    return None
+
+                for row in rows_to_delete:
+                    webhook_events.append(('DELETE', serving_apn_to_dict(row)))
+                    session.delete(row)
+                session.flush()
+                session.commit()
+                changed = True
+                self.logTool.log(
+                    service='Database',
+                    level='info',
+                    message=(
+                        f"[SERVING_APN_STATE] action=DELETE imsi={imsi} apn={apn} "
+                        f"session={requested_session_id} rows={len(rows_to_delete)}"
+                    ),
+                    redisClient=self.redisMessaging
+                )
+            else:
+                normalized_pgw = str(serving_pgw).strip()
+                normalized_routing = str(subscriber_routing).strip()
+                if not normalized_pgw or normalized_pgw.lower() == 'none':
+                    raise ValueError("serving_pgw must be a non-empty string")
+                if not normalized_routing or normalized_routing.lower() == 'none':
+                    raise ValueError("subscriber_routing must be a non-empty string")
+                if requested_session_id is None:
+                    raise ValueError("pcrf_session_id must be present for a serving-APN upsert")
+
+                # One UE IP can identify only one active PDN.  Delete a prior
+                # stale owner of the same IP, but never sweep unrelated rows
+                # merely because their routing value is empty.
+                same_ip_rows = (
+                    session.query(SERVING_APN)
+                    .filter_by(subscriber_routing=normalized_routing)
+                    .with_for_update()
+                    .all()
+                )
+
+                if existing_rows:
+                    serving_apn_row = existing_rows[0]
+                    operation = 'PATCH'
+                    duplicate_rows = existing_rows[1:]
+                else:
+                    serving_apn_row = SERVING_APN(
+                        subscriber_id=subscriber.subscriber_id,
+                        apn=apn_id
+                    )
+                    session.add(serving_apn_row)
+                    operation = 'PUT'
+                    duplicate_rows = []
+
+                stale_rows = {
+                    row.serving_apn_id: row
+                    for row in duplicate_rows + same_ip_rows
+                    if row is not serving_apn_row
+                }
+                for stale_row in stale_rows.values():
+                    session.delete(stale_row)
+
+                serving_apn_row.pcrf_session_id = requested_session_id
+                serving_apn_row.serving_pgw = normalized_pgw
+                serving_apn_row.serving_pgw_realm = (
+                    None if serving_pgw_realm is None else str(serving_pgw_realm)
+                )
+                serving_apn_row.serving_pgw_peer = (
+                    None if serving_pgw_peer is None else str(serving_pgw_peer)
+                )
+                serving_apn_row.serving_pgw_timestamp = parsed_timestamp
+                serving_apn_row.subscriber_routing = normalized_routing
+                serving_apn_row.last_modified = serving_pgw_timestamp_string
+
+                session.flush()
+                result_data = serving_apn_to_dict(serving_apn_row)
+                webhook_events.append((operation, result_data.copy()))
+                session.commit()
+                changed = True
+                self.logTool.log(
+                    service='Database',
+                    level='info',
+                    message=(
+                        f"[SERVING_APN_STATE] action=UPSERT operation={operation} "
+                        f"imsi={imsi} apn={apn} session={requested_session_id} "
+                        f"ip={normalized_routing} id={serving_apn_row.serving_apn_id} "
+                        f"stale_rows_removed={len(stale_rows)}"
+                    ),
+                    redisClient=self.redisMessaging
+                )
+        except Exception as error:
+            self.safe_rollback(session)
+            self.logTool.log(
+                service='Database',
+                level='error',
+                message=(
+                    f"[SERVING_APN_STATE] action=TRANSACTION_FAILED imsi={imsi} "
+                    f"apn={apn} session={requested_session_id} error={error} "
+                    f"traceback={traceback.format_exc()}"
+                ),
+                redisClient=self.redisMessaging
+            )
+            raise
+        finally:
+            self.safe_close(session)
+
+        # Side effects deliberately run only after the database commit.  Their
+        # failure must never roll back or delete valid Gx state needed by Rx.
+        for operation, object_data in webhook_events:
+            try:
+                self.handleWebhook(object_data, operation)
+            except Exception as error:
+                self.logTool.log(
+                    service='Database',
+                    level='warning',
+                    message=(
+                        f"[SERVING_APN_STATE] action=WEBHOOK_FAILED imsi={imsi} "
+                        f"apn={apn} operation={operation} error={error}"
+                    ),
+                    redisClient=self.redisMessaging
+                )
+
+        if changed and propagate:
+            try:
+                if 'PCRF' in config['geored']['sync_actions'] and self.georedEnabled:
+                    self.handleGeored({
+                        'imsi': imsi,
+                        'serving_apn': apn,
+                        'pcrf_session_id': pcrf_session_id,
+                        'serving_pgw': serving_pgw,
+                        'serving_pgw_realm': serving_pgw_realm,
+                        'serving_pgw_peer': serving_pgw_peer,
+                        'serving_pgw_timestamp': serving_pgw_timestamp_string,
+                        'subscriber_routing': subscriber_routing
+                    })
+            except Exception as error:
+                self.logTool.log(
+                    service='Database',
+                    level='warning',
+                    message=(
+                        f"[SERVING_APN_STATE] action=GEORED_FAILED imsi={imsi} "
+                        f"apn={apn} error={error}"
+                    ),
+                    redisClient=self.redisMessaging
+                )
+
+        return result_data
 
     def Get_Serving_APN(self, subscriber_id, apn_id):
         self.logTool.log(service='Database', level='debug', message="Getting Serving APN " + str(apn_id) + " with subscriber_id " + str(subscriber_id), redisClient=self.redisMessaging)

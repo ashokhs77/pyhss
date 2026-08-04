@@ -1352,6 +1352,131 @@ class Diameter:
             self.logTool.log(service='AS', level='error', message=f"[diameter.py] [generateDiameterRequest] [{requestType}] Error generating diameter outbound request: {traceback.format_exc()}", redisClient=self.redisMessaging)
             return ''
 
+    def resolveRxSubscriberFromServingApn(self, subscriptionId, ipServingApn):
+        """
+        Resolve an Rx subscriber from the already authenticated Gx bearer.
+
+        The P-CSCF supplies both Framed-IP-Address and Subscription-Id in the
+        AAR.  The serving APN owns that IP, so use its subscriber_id as the
+        authoritative lookup key and cross-check the claimed IMSI/MSISDN.  This
+        avoids repeating several IMSI/MSISDN queries on the Rx critical path.
+        """
+        if not ipServingApn:
+            return None
+
+        claimedIdentifier = str(subscriptionId or '').strip()
+        for prefix in ('sip:', 'tel:'):
+            if claimedIdentifier.startswith(prefix):
+                claimedIdentifier = claimedIdentifier[len(prefix):]
+        claimedIdentifier = claimedIdentifier.split('@')[0].split(';')[0]
+        subscriberId = ipServingApn.get('subscriber_id', None)
+        if not subscriberId or not claimedIdentifier:
+            return None
+
+        for attempt in range(2):
+            try:
+                subscriberDetails = self.database.Get_Subscriber(subscriber_id=subscriberId)
+                if not subscriberDetails.get('enabled', False):
+                    self.logTool.log(service='HSS', level='warning', message=f"[RX_IDENTITY] source=framed-ip rejected=disabled subscriberId={subscriberId}", redisClient=self.redisMessaging)
+                    return None
+
+                imsi = str(subscriberDetails.get('imsi', '') or '')
+                imsSubscriberDetails = self.database.Get_IMS_Subscriber(imsi=imsi)
+                msisdn = str(imsSubscriberDetails.get('msisdn', '') or subscriberDetails.get('msisdn', '') or '')
+
+                allowedIdentifiers = {
+                    imsi,
+                    str(subscriberDetails.get('msisdn', '') or ''),
+                    str(imsSubscriberDetails.get('msisdn', '') or ''),
+                }
+                for msisdnEntry in str(imsSubscriberDetails.get('msisdn_list', '') or '').split(','):
+                    allowedIdentifiers.add(msisdnEntry.strip())
+                allowedIdentifiers.discard('')
+
+                if claimedIdentifier not in allowedIdentifiers:
+                    message = f"[RX_IDENTITY] source=framed-ip rejected=claim-mismatch framedIp={ipServingApn.get('subscriber_routing')} subscriberId={subscriberId} claim={claimedIdentifier}"
+                    self.logTool.log(service='HSS', level='warning', message=message, redisClient=self.redisMessaging)
+                    return None
+
+                message = f"[RX_IDENTITY] source=framed-ip framedIp={ipServingApn.get('subscriber_routing')} subscriberId={subscriberId} imsi={imsi} msisdn={msisdn} claim={claimedIdentifier}"
+                self.logTool.log(service='HSS', level='info', message=message, redisClient=self.redisMessaging)
+                return {
+                    'subscriberDetails': subscriberDetails,
+                    'imsSubscriberDetails': imsSubscriberDetails,
+                    'imsi': imsi,
+                    'msisdn': msisdn,
+                }
+            except Exception:
+                message = f"[RX_IDENTITY] source=framed-ip attempt={attempt + 1} subscriberId={subscriberId} error={traceback.format_exc()}"
+                self.logTool.log(service='HSS', level='warning', message=message, redisClient=self.redisMessaging)
+                if attempt == 0:
+                    time.sleep(0.02)
+
+        return None
+
+    def resolveRxSubscriberFromSubscriptionId(self, subscriptionId):
+        """
+        Resolve a public IMS identity through IMS_SUBSCRIBER first.
+
+        Some deployments intentionally keep the public MSISDN only in the IMS
+        subscriber table.  Looking up SUBSCRIBER by MSISDN first incorrectly
+        rejects those users even though their IMS profile is valid.  This is
+        also the safe fallback when the Gx serving-APN row is temporarily not
+        visible to the Rx worker.
+        """
+        claimedIdentifier = str(subscriptionId or '').strip()
+        for prefix in ('sip:', 'tel:'):
+            if claimedIdentifier.startswith(prefix):
+                claimedIdentifier = claimedIdentifier[len(prefix):]
+        claimedIdentifier = claimedIdentifier.split('@')[0].split(';')[0]
+        if not claimedIdentifier:
+            return None
+
+        for attempt in range(2):
+            try:
+                if claimedIdentifier.isdigit() and len(claimedIdentifier) >= 14:
+                    imsSubscriberDetails = self.database.Get_IMS_Subscriber(imsi=claimedIdentifier)
+                else:
+                    imsSubscriberDetails = self.database.Get_IMS_Subscriber(msisdn=claimedIdentifier)
+
+                imsi = str(imsSubscriberDetails.get('imsi', '') or '')
+                if not imsi:
+                    return None
+                subscriberDetails = self.database.Get_Subscriber(imsi=imsi)
+                if not subscriberDetails.get('enabled', False):
+                    self.logTool.log(service='HSS', level='warning', message=f"[RX_IDENTITY] source=subscription-id rejected=disabled imsi={imsi}", redisClient=self.redisMessaging)
+                    return None
+
+                msisdn = str(imsSubscriberDetails.get('msisdn', '') or subscriberDetails.get('msisdn', '') or '')
+                allowedIdentifiers = {
+                    imsi,
+                    str(subscriberDetails.get('msisdn', '') or ''),
+                    str(imsSubscriberDetails.get('msisdn', '') or ''),
+                }
+                for msisdnEntry in str(imsSubscriberDetails.get('msisdn_list', '') or '').split(','):
+                    allowedIdentifiers.add(msisdnEntry.strip())
+                allowedIdentifiers.discard('')
+                if claimedIdentifier not in allowedIdentifiers:
+                    message = f"[RX_IDENTITY] source=subscription-id rejected=claim-mismatch imsi={imsi} claim={claimedIdentifier}"
+                    self.logTool.log(service='HSS', level='warning', message=message, redisClient=self.redisMessaging)
+                    return None
+
+                message = f"[RX_IDENTITY] source=subscription-id imsi={imsi} msisdn={msisdn} claim={claimedIdentifier}"
+                self.logTool.log(service='HSS', level='info', message=message, redisClient=self.redisMessaging)
+                return {
+                    'subscriberDetails': subscriberDetails,
+                    'imsSubscriberDetails': imsSubscriberDetails,
+                    'imsi': imsi,
+                    'msisdn': msisdn,
+                }
+            except Exception:
+                message = f"[RX_IDENTITY] source=subscription-id attempt={attempt + 1} claim={claimedIdentifier} error={traceback.format_exc()}"
+                self.logTool.log(service='HSS', level='warning', message=message, redisClient=self.redisMessaging)
+                if attempt == 0:
+                    time.sleep(0.02)
+
+        return None
+
     def validateImsSubscriber(self, imsi=None, msisdn=None) -> bool:
         """
         Ensures that a given IMSI or MSISDN (Or both, if specified) are associated with a subscriber that is enabled, and has an associated IMS Subscriber record.
@@ -1369,6 +1494,7 @@ class Diameter:
                 imsSubscriberDetails = self.database.Get_IMS_Subscriber(imsi=imsi)
                 self.logTool.log(service='AS', level='debug', message=f"[diameter.py] [validateImsSubscriber] IMS Subscriber validated based on IMSI OK", redisClient=self.redisMessaging)
         except Exception as e:
+            self.logTool.log(service='AS', level='warning', message=f"[diameter.py] [validateImsSubscriber] IMSI lookup failed for {imsi}: {traceback.format_exc()}", redisClient=self.redisMessaging)
             return False
         try:
             if msisdn is not None:
@@ -1378,6 +1504,7 @@ class Diameter:
                 imsSubscriberDetails = self.database.Get_IMS_Subscriber(msisdn=msisdn)
                 self.logTool.log(service='AS', level='debug', message=f"[diameter.py] [validateImsSubscriber] IMS Subscriber validated based on MSISDN OK", redisClient=self.redisMessaging)
         except Exception as e:
+            self.logTool.log(service='AS', level='warning', message=f"[diameter.py] [validateImsSubscriber] MSISDN lookup failed for {msisdn}: {traceback.format_exc()}", redisClient=self.redisMessaging)
             return False
         
         return True
@@ -3630,6 +3757,8 @@ class Diameter:
             remoteServingApn = None
             servingApn = None
             ipServingApn = None
+            subscriberDetails = None
+            imsSubscriberDetails = None
             try:
                 serviceUrn = bytes.fromhex(self.get_avp_data(avps, 525)[0]).decode('ascii')
             except:
@@ -3694,7 +3823,28 @@ class Diameter:
 
             self.logTool.log(service='HSS', level='debug', message=f"[diameter.py] [Answer_16777236_265] [AAA] IP APN Name: {ipApnName}", redisClient=self.redisMessaging)
 
-            if '@' in subscriptionId:
+            rxSubscriber = None
+            if ipServingApn and not emergencySubscriber:
+                rxSubscriber = self.resolveRxSubscriberFromServingApn(
+                    subscriptionId=subscriptionId,
+                    ipServingApn=ipServingApn
+                )
+            elif not emergencySubscriber:
+                rxSubscriber = self.resolveRxSubscriberFromSubscriptionId(
+                    subscriptionId=subscriptionId
+                )
+                if rxSubscriber:
+                    fallbackMessage = f"[RX_IDENTITY] fallback=subscription-id reason=no-serving-apn framedIp={ueIp}"
+                    self.logTool.log(service='HSS', level='warning', message=fallbackMessage, redisClient=self.redisMessaging)
+
+            if rxSubscriber:
+                subscriberDetails = rxSubscriber.get('subscriberDetails')
+                imsSubscriberDetails = rxSubscriber.get('imsSubscriberDetails')
+                imsi = rxSubscriber.get('imsi')
+                msisdn = rxSubscriber.get('msisdn')
+                identifier = 'framed-ip' if ipServingApn else 'subscription-id'
+
+            if identifier is None and '@' in subscriptionId:
                 subscriberIdentifier = subscriptionId.split('@')[0]
                 # Subscriber Identifier can be either an IMSI or an MSISDN
                 try:
@@ -3721,7 +3871,7 @@ class Diameter:
                         self.logTool.log(service='HSS', level='debug', message=f"[diameter.py] [Answer_16777236_265] [AAA] Found IMSI {imsi} by IP: {ueIP}", redisClient=self.redisMessaging)
                     except Exception as e:
                         pass
-            else:
+            elif identifier is None:
                 imsi = None
                 msisdn = None
                 try:
@@ -3735,7 +3885,12 @@ class Diameter:
                     pass
 
             self.logTool.log(service='HSS', level='debug', message=f"[diameter.py] [Answer_16777236_265] [AAA] IMSI: {imsi} / MSISDN: {msisdn}", redisClient=self.redisMessaging)
-            imsEnabled = self.validateImsSubscriber(imsi=imsi, msisdn=msisdn)
+            if subscriberDetails and imsSubscriberDetails:
+                imsEnabled = bool(subscriberDetails.get('enabled', False))
+                validationMessage = f"[RX_IDENTITY] validation=preloaded identifier={identifier} imsi={imsi} msisdn={msisdn} enabled={imsEnabled}"
+                self.logTool.log(service='HSS', level='info', message=validationMessage, redisClient=self.redisMessaging)
+            else:
+                imsEnabled = self.validateImsSubscriber(imsi=imsi, msisdn=msisdn)
 
             if imsEnabled or emergencySubscriber:
                 """
@@ -3781,18 +3936,9 @@ class Diameter:
                     # Extract all Media-Component-Description AVPs
                     media_components = self.get_avp_data(avps, 517)
 
-                    # --- Remove the GBR-Video bearer on a genuine video->audio downgrade ---
-                    # A video->audio switch sends a modification AAR that omits the video
-                    # Media-Component; the GBR-Video QCI-2 bearer must then be removed or the
-                    # strict MTK UE BYEs the call ~3 s later (issue 5/6, TS 29.214).
-                    # BUT an audio->video switch ALSO produces transient audio-only AARs
-                    # (before the audio+video state settles).  An earlier version removed on
-                    # every audio-only AAR and churned the just-installed video bearer
-                    # (2 AARs -> 40+ RARs, SMF rule_count:0) so A->V never got a video
-                    # bearer.  Distinguish by TIME (synchronous, no timer thread): only
-                    # remove the video rule if it has been installed longer than
-                    # VIDEO_STABLE_SECS (a real downgrade of a stable video), never when it
-                    # was just added (transient during an upgrade).
+                    # Remove video rules only after a stable video session. An
+                    # audio-only AAR immediately after installation can be a
+                    # transient part of an audio-to-video upgrade.
                     try:
                         VIDEO_STABLE_SECS = 5.0
                         presentMediaTypes = set()
@@ -3950,14 +4096,8 @@ class Diameter:
                             except Exception as e:
                                 pass
 
-                            # 3GPP TS 29.213: when the RTCP flows are carried in the same PCC
-                            # rule (they are - the TFT includes the RTCP ports), the rule MBR
-                            # must be Max-Requested-Bandwidth + RS-Bandwidth + RR-Bandwidth so
-                            # the bearer fits RTP plus RTCP (e.g. 41000+512+1537=43049 for
-                            # AMR-WB).  Granting MBR=GBR=AS leaves the bearer 2049 bps short;
-                            # strict UE stacks (MTK VoLTE, e.g. Optimus) treat the reservation
-                            # as insufficient, never alert, and reject with 480 after the 183.
-                            # The Amarisoft PCF grants exactly AS+RS+RR, which works.
+                            # Include RTCP sender/receiver bandwidth in the PCC
+                            # rule MBR when RTP and RTCP share the rule.
                             mbrUlBandwidth = ulBandwidth
                             mbrDlBandwidth = dlBandwidth
                             try:
@@ -4001,13 +4141,8 @@ class Diameter:
                                                 tftDirection = 2
                                                 self.logTool.log(service='HSS', level='debug', message=f"[diameter.py] [Answer_16777236_265] [AAA] Recompiled 'permit in' TFT to: {decodedTft}", redisClient=self.redisMessaging)
 
-                                            # 3GPP TS 24.008/24.301: a network-provided TFT may only carry
-                                            # local (UE-side) address/port components when the network has
-                                            # signalled "local address in TFT" support in PCO, which open5gs
-                                            # does not do.  Strict UE stacks (MTK VoLTE) then fail to bind the
-                                            # dedicated bearer to the media flow and reject the call with 480
-                                            # after the 183.  Strip the UE-side port so the packet filter only
-                                            # carries remote address/port/protocol (legal without the PCO flag).
+                                            # Do not include a UE-side port unless local-address
+                                            # TFT support was negotiated in PCO.
                                             decodedTftSplit = decodedTft.split(' ')
                                             if len(decodedTftSplit) == 9 and decodedTftSplit[6] == 'to':
                                                 decodedTft = ' '.join(decodedTftSplit[:8])
@@ -4146,18 +4281,7 @@ class Diameter:
                                 self.logTool.log(service='HSS', level='debug', message=f"[diameter.py] [Answer_16777236_265] [AAA] Updating Emergency Subscriber: {updatedEmergencySubscriberData}", redisClient=self.redisMessaging)
                                 self.database.Update_Emergency_Subscriber(subscriberIp=ueIp, subscriberData=updatedEmergencySubscriberData, imsi=imsi)
 
-                            # NOTE: A staggered/deferred-RAR scheme (defer each subsequent
-                            # media component's RAR by 2.5 s on a timer thread) was tried
-                            # here to dodge the eNB one-RRC-reconfiguration-at-a-time limit
-                            # on the first video call after attach.  It was REMOVED: firing
-                            # a bearer-install RAR 2.5 s later on a timer thread races the
-                            # call state (a mid-call switch or hangup may have moved on by
-                            # then), which caused UE detaches and one-way audio on audio<->
-                            # video switches.  RARs are sent immediately again.  The first-
-                            # video-after-attach eNB race must be solved another way (e.g.
-                            # eNB config, or a non-racy serialization) - not with a timer.
                             self.logTool.log(service='HSS', level='debug', message=f"[diameter.py] [Answer_16777236_265] [AAA] RAR Generated to be sent to serving PGW: {servingPgw} via peer {servingPgwPeer}", redisClient=self.redisMessaging)
-                            print(f"[diameter.py] [Answer_16777236_265] [AAA] Sending RAR mediaType={int(mediaType, 16)} qci={qci} ueIp={ueIp} pcrfSessionId={pcrfSessionId} rule={rule_name} tfts={completedTftList}", flush=True)
                             reAuthAnswer = self.awaitDiameterRequestAndResponse(
 	                                requestType='RAR',
 	                                hostname=servingPgwPeer,
@@ -4174,21 +4298,15 @@ class Diameter:
                             
                             raaPacketVars, raaAvps = self.decode_diameter_packet(reAuthAnswer)
                             raaResultCode = int(self.get_avp_data(raaAvps, 268)[0], 16)
-                            print(f"[diameter.py] [Answer_16777236_265] [AAA] RAA result mediaType={int(mediaType, 16)} qci={qci} ueIp={ueIp} result={raaResultCode} rule={rule_name}", flush=True)
+                            self.logTool.log(service='HSS', level='debug', message=f"[RX_RAA] mediaType={int(mediaType, 16)} qci={qci} ueIp={ueIp} result={raaResultCode} rule={rule_name}", redisClient=self.redisMessaging)
 
                             if raaResultCode == 2001:
 	                            rAAAResultCode = 2001
 	                            self.logTool.log(service='HSS', level='info', message=f"[diameter.py] [Answer_16777236_265] [AAA] RAA returned Successfully, authorizing request", redisClient=self.redisMessaging)
-	                            # --- FIX: store per-Rx-session → Gx binding in Redis ---
-	                            # This allows the STR handler to look up the correct Gx session
-	                            # for THIS specific Rx session, even when multiple concurrent
-	                            # sessions share the same UE IP / subscriber (e.g. hold+second call).
+	                            # Store the Rx-to-Gx binding used by the STR handler.
 	                            try:
 	                                rx_session_key = f"rx_session:{sessionId}"
-	                                # --- Merge rules: read existing binding and append new rule ---
-	                                # A voice+video upgrade sends two AARs on the SAME session ID.
-	                                # The second (Video) must not overwrite the first (Voice).
-	                                # We keep a 'rules' list so STR can remove ALL installed rules.
+	                                # Preserve every rule installed for this Rx session.
 	                                existing_raw = self.redisMessaging.getValue(key=rx_session_key)
 	                                if existing_raw:
 	                                    existing_binding = json.loads(existing_raw)
@@ -4207,25 +4325,21 @@ class Diameter:
 	                                        "rule_name": rule_name,
 	                                        "rules": [rule_name],
 	                                    }
-	                                # Record the FIRST video (GBR-Video) rule install time so the
-	                                # audio<->video downgrade removal can tell a genuine video->audio
-	                                # switch (video stable for seconds) from a transient audio-only AAR
-	                                # during audio->video setup (video just installed).
+	                                # Track the first video-rule installation for
+	                                # stable downgrade detection.
 	                                if rule_name.startswith("GBR-Video") and not rx_session_binding.get("video_installed_at"):
 	                                    rx_session_binding["video_installed_at"] = time.time()
 	                                self.redisMessaging.setValue(key=rx_session_key, value=json.dumps(rx_session_binding), keyExpiry=7200)
-	                                self.logTool.log(service='HSS', level='info', message=f"[diameter.py] [Answer_16777236_265] [AAA] Stored Rx→Gx binding in Redis: key={rx_session_key} pcrfSessionId={pcrfSessionId} rules={rx_session_binding['rules']}", redisClient=self.redisMessaging)
+	                                self.logTool.log(service='HSS', level='info', message=f"[RX_GX_BINDING] key={rx_session_key} pcrfSessionId={pcrfSessionId} rules={rx_session_binding['rules']}", redisClient=self.redisMessaging)
 	                            except Exception as redis_ex:
-	                                self.logTool.log(service='HSS', level='error', message=f"[diameter.py] [Answer_16777236_265] [AAA] Failed to store Rx→Gx binding in Redis: {traceback.format_exc()}", redisClient=self.redisMessaging)
+	                                self.logTool.log(service='HSS', level='error', message=f"[RX_GX_BINDING] action=STORE_FAILED error={traceback.format_exc()}", redisClient=self.redisMessaging)
                             else:
 	                            rAAAResultCode = 4001
 	                            self.logTool.log(service='HSS', level='info', message=f"[diameter.py] [Answer_16777236_265] [AAA] RAA returned Unauthorized, declining request", redisClient=self.redisMessaging)
-	                            print(f"[diameter.py] [Answer_16777236_265] [AAA] RAA unauthorized mediaType={int(mediaType, 16)} qci={qci} ueIp={ueIp} result={raaResultCode} rule={rule_name}", flush=True)
 
                         except Exception as e:
                             self.logTool.log(service='HSS', level='error', message=f"[diameter.py] [Answer_16777236_265] [AAA] Error processing RAR / RAA, declining request: {traceback.format_exc()}", redisClient=self.redisMessaging)
                             rAAAResultCode = 4001
-                            print(f"[diameter.py] [Answer_16777236_265] [AAA] RAR/RAA exception mediaType={int(mediaType, 16) if mediaType else 'unknown'} ueIp={ueIp}: {traceback.format_exc()}", flush=True)
                 except Exception as e:
                     self.logTool.log(service='HSS', level='error', message=f"[diameter.py] [Answer_16777236_265] [AAA] Error generating AAA Charging Rule: {traceback.format_exc()}", redisClient=self.redisMessaging)
                     rAAAResultCode = 4001
