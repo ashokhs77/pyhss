@@ -6,5 +6,5 @@ class InvalidIMSI(Exception):
 
 
 def validate_imsi(imsi):
-    if not re.match(r'^\d{6,15}$', imsi):
+    if not re.fullmatch(r'\d+', imsi):
         raise InvalidIMSI(f"IMSI is invalid: {imsi}")

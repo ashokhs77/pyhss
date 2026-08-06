@@ -2674,7 +2674,7 @@ class Database:
             return False
 
     def Store_IMSI_IMEI_Binding(self, imsi, imei, match_response_code, propagate=True):
-        #IMSI           14-15 Digits
+        #IMSI           Variable-length numeric identifier
         #IMEI           15 Digits
         #IMEI-SV        2 Digits
         self.logTool.log(service='Database', level='debug', message=f"[database.py] [Store_IMSI_IMEI_Binding] Received IMSI: {imsi}, IMEI: {imei}, Match Response Code: {match_response_code}", redisClient=self.redisMessaging)

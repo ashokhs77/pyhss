@@ -65,14 +65,14 @@ diameterClient = Diameter(
 databaseClient = database.Database(logTool=logTool, redisMessaging=redisMessaging)
 
 def _valid_imsi(imsi):
-    """Narrow input check: True if imsi is a 14-15 digit numeric string (MCC+MNC+MSIN)."""
+    """Return True when IMSI is a non-empty numeric string."""
     s = str(imsi) if imsi is not None else ''
-    return s.isdigit() and 14 <= len(s) <= 15
+    return s.isdigit()
 
-def _valid_hex(val, length):
-    """Narrow input check: True if val is a hex string of exactly `length` characters."""
+def _valid_hex(val, length=None):
+    """Return True when val is non-empty hex, optionally with an exact length."""
     s = str(val) if val is not None else ''
-    return len(s) == length and all(c in '0123456789abcdefABCDEF' for c in s)
+    return bool(s) and (length is None or len(s) == length) and all(c in '0123456789abcdefABCDEF' for c in s)
 
 apiService = Flask(__name__)
 
@@ -581,12 +581,13 @@ class PyHSS_AUC(Resource):
                 return {'result': 'Failed', 'error': 'Malformed JSON body'}, 400
             if not isinstance(json_data, dict):
                 return {'result': 'Failed', 'error': 'JSON body must be a JSON object'}, 400
-            # Narrow input validation: reject clearly-malformed values only; valid provisioning is unaffected.
+            # Reject malformed values without imposing mobile-network lengths on SIP test identities.
             if json_data.get('imsi') not in (None, '') and not _valid_imsi(json_data.get('imsi')):
-                return {'result': 'Failed', 'error': 'Invalid IMSI (must be 14-15 digits)'}, 400
-            for _k in ('ki', 'opc'):
-                if json_data.get(_k) not in (None, '') and not _valid_hex(json_data.get(_k), 32):
-                    return {'result': 'Failed', 'error': 'Invalid %s (must be 32 hex characters)' % _k}, 400
+                return {'result': 'Failed', 'error': 'Invalid IMSI (must contain only digits)'}, 400
+            if json_data.get('ki') not in (None, '') and not _valid_hex(json_data.get('ki')):
+                return {'result': 'Failed', 'error': 'Invalid ki (must contain only hex characters)'}, 400
+            if json_data.get('opc') not in (None, '') and not _valid_hex(json_data.get('opc'), 32):
+                return {'result': 'Failed', 'error': 'Invalid opc (must be 32 hex characters)'}, 400
             args = parser.parse_args()
             operation_id = args.get('operation_id', None)
             data = databaseClient.CreateObj(AUC, json_data, False, operation_id)
@@ -734,8 +735,8 @@ if UPLOAD_ENABLED :
                 created = []
 
                 for _, row in df.iterrows():
-                    # FIX: always cast to string before zfill/replace
-                    imsi = str(row["imsi"]).split('.')[0].zfill(15) if pd.notna(row["imsi"]) else None
+                    # Always cast spreadsheet values to strings before normalization.
+                    imsi = str(row["imsi"]).split('.')[0] if pd.notna(row["imsi"]) else None
                     msisdn = str(row["msisdn"]).replace('+', '') if pd.notna(row["msisdn"]) else None
 
                     # === AUC data ===
@@ -822,7 +823,7 @@ if UPLOAD_ENABLED :
 
             try:
                 df = pd.read_excel(file, dtype={"imsi": str})
-                df['imsi'] = df['imsi'].apply(lambda x: x.strip().zfill(15))
+                df['imsi'] = df['imsi'].apply(lambda x: x.strip())
 
                 response_log = []
 
@@ -1042,10 +1043,10 @@ if UPLOAD_ENABLED :
                     if 'msisdn' in cleaned_row and cleaned_row['msisdn']:
                         cleaned_row['msisdn'] = str(cleaned_row['msisdn']).replace('+', '')
 
-                    # Normalize IMSI (primary key, always 15 digits string)
+                    # Preserve IMSI as supplied; SIP test identities may use fewer digits.
                     imsi = cleaned_row.get("imsi")
                     if imsi:
-                        imsi = str(imsi).zfill(15)
+                        imsi = str(imsi)
                         cleaned_row["imsi"] = imsi
 
                     if not imsi:
@@ -1124,7 +1125,7 @@ class PyHSS_SUBSCRIBER_IMSI(Resource):
         '''Get data for IMSI'''
         try:
             if not _valid_imsi(imsi):
-                return {'result': 'Failed', 'error': 'Invalid IMSI format (must be 14-15 digits)'}, 400
+                return {'result': 'Failed', 'error': 'Invalid IMSI format (must contain only digits)'}, 400
             data = databaseClient.Get_Subscriber(imsi=imsi, get_attributes=True)
             return data, 200
         except Exception as E:
@@ -1267,7 +1268,7 @@ class PyHSS_IMS_SUBSCRIBER(Resource):
             if not isinstance(json_data, dict):
                 return {'result': 'Failed', 'error': 'JSON body must be a JSON object'}, 400
             if json_data.get('imsi') not in (None, '') and not _valid_imsi(json_data.get('imsi')):
-                return {'result': 'Failed', 'error': 'Invalid IMSI (must be 14-15 digits)'}, 400
+                return {'result': 'Failed', 'error': 'Invalid IMSI (must contain only digits)'}, 400
             if 'msisdn' in json_data:
                 json_data['msisdn'] = json_data['msisdn'].replace('+', '')
             if 'msisdn_list' in json_data:

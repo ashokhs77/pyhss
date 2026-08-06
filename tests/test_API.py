@@ -142,6 +142,19 @@ class AUC_Tests(unittest.TestCase):
         xres = {"Result": "OK"}
         self.assertEqual(xres, r.json(), "JSON body should match " + str(xres))
 
+    def test_G_create_AUC_with_variable_length_imsi_and_ki(self):
+        headers = {"Content-Type": "application/json"}
+        payload = {
+            "imsi": "123",
+            "ki": "abc123",
+            "opc": "44d51018f65affc04e6d56d699df3a76",
+            "amf": "8000",
+            "sqn": 99,
+        }
+        r = requests.put(str(base_url) + '/auc/', data=json.dumps(payload), headers=headers)
+        self.assertEqual(r.status_code, 200, "Variable-length IMSI and Ki should be accepted")
+        requests.delete(str(base_url) + '/auc/' + str(r.json()['auc_id']))
+
 class Subscriber_Tests(unittest.TestCase):
     subscriber_id = 0
     apn_secondary = 0
