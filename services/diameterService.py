@@ -87,8 +87,9 @@ class DiameterService:
         while True:
             try:
                 outboundDwrEncoded = await(self.diameterLibrary.Request_280(originHost=self.originHost, originRealm=self.originRealm))
-                activePeersCached = self.activePeers
-                for activePeerKey, activePeerValue in activePeersCached.items():
+                # Iterate over a snapshot: handleConnection() and handleActiveDiameterPeers() may add or
+                # remove peers while this loop is awaiting sendMessage() (#310)
+                for activePeerKey, activePeerValue in list(self.activePeers.items()):
 
                     isConnected = activePeerValue.Connected
                     peerIp = activePeerValue.IpAddress
@@ -127,7 +128,7 @@ class DiameterService:
 
                 activeDiameterPeersTimeout = config.get('hss', {}).get('active_diameter_peers_timeout', 3600)
 
-                activePeers = self.activePeers
+                activePeers = dict(self.activePeers)
                 stalePeers = []
                 diameterHosts = {}
 
@@ -162,8 +163,10 @@ class DiameterService:
                         await(self.logTool.logAsync(service='Diameter', level='warning', message=f"[Diameter] [handleActiveDiameterPeers] Error removing stale peer: {traceback.format_exc()}"))
                     await(self.logActivePeers())
                 
-                #Marshal the Peer objects and store in Redis
-                for peerKey, peer in activePeers.items():
+                #Marshal the Peer objects and store in Redis. Take a new snapshot, so that peers pruned
+                #above are not written back and peers that connect while awaiting setHashValue() don't
+                #change the size of the dict being iterated (#310)
+                for peerKey, peer in list(self.activePeers.items()):
                     await(self.redisPeerMessaging.setHashValue(name=self.diameterPeerKey, key=peerKey, value=peer.model_dump_json(), keyExpiry=86400, usePrefix=True, prefixHostname=self.hostname, prefixServiceName='diameter'))
 
                 await(asyncio.sleep(1))
@@ -177,7 +180,7 @@ class DiameterService:
         Logs the number of active connections on a rolling basis.
         """
         try:
-            activePeers = self.activePeers
+            activePeers = dict(self.activePeers)
             if not len(activePeers) > 0:
                 activePeers = ''
 
