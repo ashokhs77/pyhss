@@ -1,7 +1,16 @@
 # PyHSS RAT Technology restriction handling
 # Copyright 2025 Lennart Rosam <hello@takuto.de>
 # SPDX-License-Identifier: AGPL-3.0-or-later
-from enum import StrEnum
+try:
+    from enum import StrEnum
+except ImportError:
+    # Fork: enum.StrEnum is Python 3.11+, but the docker_open5gs PyHSS image runs
+    # Python 3.10 (ubuntu:jammy). Same behaviour for the values used here.
+    from enum import Enum
+
+    class StrEnum(str, Enum):
+        def __str__(self):
+            return str(self.value)
 
 from typing import Optional, Dict, List
 

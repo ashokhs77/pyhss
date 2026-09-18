@@ -5,7 +5,9 @@
 import asyncio
 import sys, os, json
 import time, uuid
-from datetime import datetime, UTC
+from datetime import datetime, timezone
+# Fork: datetime.UTC is Python 3.11+; the docker_open5gs PyHSS image runs Python 3.10.
+UTC = timezone.utc
 import sctp, socket
 
 sys.path.append(os.path.realpath(os.path.dirname(__file__) + "/../lib"))
