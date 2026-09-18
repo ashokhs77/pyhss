@@ -1,8 +1,11 @@
+#!/usr/bin/env python3
+# Copyright 2023-2024 David Kneipp <david@davidkneipp.com>
+# Copyright 2025 sysmocom - s.f.m.c. GmbH <info@sysmocom.de>
+# SPDX-License-Identifier: AGPL-3.0-or-later
 import asyncio
 import sys, os, json
 import time, uuid
-from datetime import datetime
-from tzlocal import get_localzone
+from datetime import datetime, UTC
 import sctp, socket
 
 sys.path.append(os.path.realpath(os.path.dirname(__file__) + "/../lib"))
@@ -15,6 +18,11 @@ from baseModels import Peer, InboundData, OutboundData
 import pydantic_core
 import traceback
 from pyhss_config import config
+
+
+def get_localzone():
+    return datetime.now(UTC).astimezone().tzinfo
+
 
 class DiameterService:
     """
@@ -48,6 +56,10 @@ class DiameterService:
         self.diameterRequests = 0
         self.diameterResponses = 0
         self.workerPoolSize = int(config.get('hss', {}).get('diameter_service_workers', 10))
+        # Fork: keep the container hostname as the Redis key prefix. lib/diameter.py,
+        # apiService and the other services still key their queues on
+        # socket.gethostname(), and docker_open5gs runs every PyHSS service in one
+        # container, so upstream 9c5a740 (use OriginHost) would split the queues.
         self.hostname = socket.gethostname()
         self.useExternalSocketService = config.get('hss', {}).get('use_external_socket_service', False)
         self.diameterPeerKey = config.get('hss', {}).get('diameter_peer_key', 'diameterPeers')
@@ -79,8 +91,9 @@ class DiameterService:
         while True:
             try:
                 outboundDwrEncoded = await(self.diameterLibrary.Request_280(originHost=self.originHost, originRealm=self.originRealm))
-                activePeersCached = self.activePeers
-                for activePeerKey, activePeerValue in activePeersCached.items():
+                # Iterate over a snapshot: handleConnection() and handleActiveDiameterPeers() may add or
+                # remove peers while this loop is awaiting sendMessage() (#310)
+                for activePeerKey, activePeerValue in list(self.activePeers.items()):
 
                     isConnected = activePeerValue.Connected
                     peerIp = activePeerValue.IpAddress
@@ -119,7 +132,7 @@ class DiameterService:
 
                 activeDiameterPeersTimeout = config.get('hss', {}).get('active_diameter_peers_timeout', 3600)
 
-                activePeers = self.activePeers
+                activePeers = dict(self.activePeers)
                 stalePeers = []
                 diameterHosts = {}
 
@@ -154,10 +167,10 @@ class DiameterService:
                         await(self.logTool.logAsync(service='Diameter', level='warning', message=f"[Diameter] [handleActiveDiameterPeers] Error removing stale peer: {traceback.format_exc()}"))
                     await(self.logActivePeers())
                 
-                #Marshal the Peer objects and store in Redis
-                #for peerKey, peer in activePeers.items():
-                for peerKey in list(activePeers.keys()):
-                    peer = activePeers[peerKey]
+                #Marshal the Peer objects and store in Redis. Take a new snapshot, so that peers pruned
+                #above are not written back and peers that connect while awaiting setHashValue() don't
+                #change the size of the dict being iterated (#310)
+                for peerKey, peer in list(self.activePeers.items()):
                     await(self.redisPeerMessaging.setHashValue(name=self.diameterPeerKey, key=peerKey, value=peer.model_dump_json(), keyExpiry=86400, usePrefix=True, prefixHostname=self.hostname, prefixServiceName='diameter'))
 
                 await(asyncio.sleep(1))
@@ -171,7 +184,7 @@ class DiameterService:
         Logs the number of active connections on a rolling basis.
         """
         try:
-            activePeers = self.activePeers
+            activePeers = dict(self.activePeers)
             if not len(activePeers) > 0:
                 activePeers = ''
 
@@ -417,7 +430,7 @@ class DiameterService:
                 asyncio.create_task(self.inboundDataWorker(coroutineUuid=f'inboundDataWorker-{i}'))
 
             if host is None:
-                host=str(config.get('hss', {}).get('bind_ip', '0.0.0.0')[0])
+                host=str(config.get('hss', {}).get('bind_ip', '127.0.0.1')[0])
             
             if port is None:
                 port=int(config.get('hss', {}).get('bind_port', 3868))

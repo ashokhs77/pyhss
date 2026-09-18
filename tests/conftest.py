@@ -1,24 +1,6 @@
-"""
-    PyHSS test fixtures
-
-    Copyright (C) 2025 sysmocom - s.f.m.c. GmbH <info@sysmocom.de>
-
-    SPDX-License-Identifier: AGPL-3.0-or-later
-
-    This program is free software: you can redistribute it and/or modify
-    it under the terms of the GNU Affero General Public License as published
-    by the Free Software Foundation, either version 3 of the License, or
-    (at your option) any later version.
-
-    This program is distributed in the hope that it will be useful,
-    but WITHOUT ANY WARRANTY; without even the implied warranty of
-    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-    GNU Affero General Public License for more details.
-
-    You should have received a copy of the GNU Affero General Public License
-    along with this program.  If not, see <https://www.gnu.org/licenses/>.
-"""
-
+# PyHSS test fixtures
+# Copyright 2025 sysmocom - s.f.m.c. GmbH <info@sysmocom.de>
+# SPDX-License-Identifier: AGPL-3.0-or-later
 import os
 import subprocess
 import time
@@ -38,6 +20,14 @@ pyhss_env = {
     "PYTHONPATH": os.path.join(top_dir, "lib"),
     "PYTHONUNBUFFERED": "1",
 }
+
+
+def pytest_collection_modifyitems(session, config, items):
+    def by_slow(item):
+        return 0 if item.get_closest_marker("slow") is None else 1
+
+    # Run slow tests at the end
+    items.sort(key=by_slow, reverse=False)
 
 
 def wait_for_tcp_port(port, timeout=5):
@@ -66,7 +56,7 @@ def create_test_db():
         print(f"Removing previous test DB: {test_db}")
         os.unlink(test_db)
 
-    db = Database(LogTool(config))
+    db = Database(LogTool(config), main_service=True)
     assert os.path.exists(test_db)
 
     db.CreateObj(APN, {

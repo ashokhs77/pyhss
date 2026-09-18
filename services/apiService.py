@@ -1,6 +1,13 @@
+#!/usr/bin/env python3
+# Copyright 2022-2025 Nick <nick@nickvsnetworking.com>
+# Copyright 2023-2025 David Kneipp <david@davidkneipp.com>
+# Copyright 2025 sysmocom - s.f.m.c. GmbH <info@sysmocom.de>
+# Copyright 2025-2026 Lennart Rosam <hello@takuto.de>
+# Copyright 2025-2026 Alexander Couzens <lynxis@fe80.eu>
+# SPDX-License-Identifier: AGPL-3.0-or-later
 import sys
 import json
-from flask import Flask, request, jsonify, Response
+from flask import Flask, request, jsonify, Response, redirect
 from flask_restx import Api, Resource, fields, reqparse, abort
 from werkzeug.middleware.proxy_fix import ProxyFix
 from functools import wraps
@@ -17,6 +24,7 @@ from logtool import LogTool
 from diameter import Diameter
 from messaging import RedisMessaging
 from baseModels import SubscriberInfo
+from version import pyhss_version
 import database
 import yaml
 import io
@@ -76,6 +84,10 @@ def _valid_hex(val, length=None):
 
 apiService = Flask(__name__)
 
+@apiService.route("/")
+def PyHSS_API_redirect_to_docs():
+    return redirect("/docs/")
+
 APN = database.APN
 Serving_APN = database.SERVING_APN
 AUC = database.AUC
@@ -94,9 +106,12 @@ EMERGENCY_SUBSCRIBER = database.EMERGENCY_SUBSCRIBER
 
 
 apiService.wsgi_app = ProxyFix(apiService.wsgi_app)
-api = Api(apiService, version='1.0', title=f'{siteName + " - " if siteName else ""}{originHostname} - PyHSS OAM API',
-    description='Restful API for working with PyHSS',
-    doc='/docs/'
+api = Api(
+    apiService,
+    version=pyhss_version,
+    title=f"{siteName + ' - ' if siteName else ''}{originHostname} - PyHSS OAM API",
+    description="Restful API for working with PyHSS",
+    doc="/docs/",
 )
 
 ns_apn = api.namespace('apn', description='PyHSS APN Functions')
@@ -271,7 +286,12 @@ def auth_required(f):
     return decorated_function
 
 def auth_before_request():
-    if request.path.startswith('/docs') or request.path.startswith('/swagger') or request.path.startswith('/metrics'):
+    if (
+        request.path.startswith("/docs")
+        or request.path.startswith("/swagger")
+        or request.path.startswith("/metrics")
+        or request.path == "/"
+    ):
         return None
     if request.method == "OPTIONS":
         res = Response()
@@ -926,6 +946,20 @@ class PyHSS_AUC_Get_AKA_Vectors(Resource):
             print(E)
             return handle_exception(E)
 
+@ns_auc.route('/aka/resync/imsi/<string:imsi>/auts/<string:auts>/rand/<string:rand>')
+class PyHSS_AUC_Get_AKA_Vectors_Resync(Resource):
+    def get(self, imsi, auts, rand):
+        '''do SQN resync'''
+        try:
+            #Get data from AuC
+            auc_data = databaseClient.Get_AuC(imsi=imsi)
+            rand = binascii.unhexlify(rand)
+            vector_dict = databaseClient.Get_Vectors_AuC(auc_data['auc_id'], action='sqn_resync', auts=auts, rand=rand)
+            return vector_dict, 200
+        except Exception as E:
+            print(E)
+            return handle_exception(E)
+
 @ns_subscriber.route('/<string:subscriber_id>')
 class PyHSS_SUBSCRIBER_Get(Resource):
     def get(self, subscriber_id):
@@ -961,27 +995,27 @@ class PyHSS_SUBSCRIBER_Get(Resource):
             data = databaseClient.UpdateObj(SUBSCRIBER, json_data, subscriber_id, False, operation_id)
 
             #If the subscriber is enabled, trigger an ISD in 2G
-            if 'enabled' in json_data and json_data['enabled'] == True:
-                update_event = databaseClient.Get_Gsup_SubscriberInfo(json_data['imsi'])
+            if 'enabled' in data and data['enabled'] == True:
+                update_event = databaseClient.Get_Gsup_SubscriberInfo(data['imsi'])
                 redisMessaging.sendMessage('subscriber_update', update_event.model_dump_json())
 
             #If the "enabled" flag on the subscriber is now disabled, trigger a CLR
-            if 'enabled' in json_data and json_data['enabled'] == False:
+            if 'enabled' in data and data['enabled'] == False:
                 print("Subscriber is now disabled, checking to see if we need to trigger a CLR")
                 #See if we have a serving MME set
                 try:
-                    assert(json_data['serving_mme'])
+                    assert(data['serving_mme'])
                     print("Serving MME set - Sending CLR")
 
                     diameterClient.sendDiameterRequest(
                         requestType='CLR',
-                        hostname=json_data['serving_mme'],
-                        imsi=json_data['imsi'], 
-                        DestinationHost=json_data['serving_mme'], 
-                        DestinationRealm=json_data['serving_mme_realm'], 
+                        hostname=data['serving_mme'],
+                        imsi=data['imsi'],
+                        DestinationHost=data['serving_mme'],
+                        DestinationRealm=data['serving_mme_realm'],
                         CancellationType=1
                     )
-                    print("Sent CLR via Peer " + str(json_data['serving_mme']))
+                    print("Sent CLR via Peer " + str(data['serving_mme']))
                 except:
                     print("No serving MME set - Not sending CLR")
             return data, 200
@@ -3036,7 +3070,11 @@ class PyHSS_Push_CLR(Resource):
 
 
 def main():
-    apiService.run(debug=False, host='0.0.0.0', port=8080)
+    config_api = config.get('api', {})
+    host = config_api.get('bind_ip', '127.0.0.1')
+    port = int(config_api.get('bind_port', 8080))
+
+    apiService.run(debug=False, host=host, port=port)
 
 
 if __name__ == '__main__':

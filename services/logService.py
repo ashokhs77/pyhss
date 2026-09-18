@@ -1,3 +1,6 @@
+#!/usr/bin/env python3
+# Copyright 2023-2024 David Kneipp <david@davidkneipp.com>
+# SPDX-License-Identifier: AGPL-3.0-or-later
 import os, sys, json, socket
 from datetime import datetime
 import time

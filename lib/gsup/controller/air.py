@@ -1,24 +1,8 @@
-"""
-    PyHSS GSUP Authentication Info Request Controller
-    Copyright (C) 2025  Lennart Rosam <hello@takuto.de>
-    Copyright (C) 2025  Alexander Couzens <lynxis@fe80.eu>
-
-    SPDX-License-Identifier: AGPL-3.0-or-later
-
-    This program is free software: you can redistribute it and/or modify
-    it under the terms of the GNU Affero General Public License as published
-    by the Free Software Foundation, either version 3 of the License, or
-    (at your option) any later version.
-
-    This program is distributed in the hope that it will be useful,
-    but WITHOUT ANY WARRANTY; without even the implied warranty of
-    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-    GNU Affero General Public License for more details.
-
-    You should have received a copy of the GNU Affero General Public License
-    along with this program.  If not, see <https://www.gnu.org/licenses/>.
-"""
-
+# PyHSS GSUP Authentication Info Request Controller
+# Copyright 2025 Lennart Rosam <hello@takuto.de>
+# Copyright 2025 Alexander Couzens <lynxis@fe80.eu>
+# Copyright 2026 eta <eta@eta.st>
+# SPDX-License-Identifier: AGPL-3.0-or-later
 import traceback
 
 from osmocom.gsup.message import GsupMessage, MsgType
@@ -28,6 +12,7 @@ from gsup.controller.abstract_controller import GsupController
 from gsup.protocol.gsup_msg import GsupMessageUtil, GsupMessageBuilder, GMMCause
 from gsup.protocol.ipa_peer import IPAPeer
 from logtool import LogTool
+from pyhss_config import get_unknown_subscriber_2g_reject_cause
 from utils import validate_imsi, InvalidIMSI
 
 
@@ -96,7 +81,7 @@ class AIRController(GsupController):
                 peer,
                 GsupMessageBuilder().with_msg_type(MsgType.SEND_AUTH_INFO_ERROR)
                 .with_ie('imsi', imsi)
-                .with_ie('cause', GMMCause.IMSI_UNKNOWN.value)
+                .with_ie('cause', get_unknown_subscriber_2g_reject_cause().value)
                 .build(),
             )
         except Exception as e:

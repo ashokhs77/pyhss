@@ -1,9 +1,12 @@
+# Copyright 2022-2023 Nick <nick@nickvsnetworking.com>
+# Copyright 2023 David Kneipp <david@davidkneipp.com>
+# Copyright 2025 sysmocom - s.f.m.c. GmbH <info@sysmocom.de>
+# SPDX-License-Identifier: AGPL-3.0-or-later
 import unittest
 import requests
 import json
 import logging
 import pytest
-from fixtures import create_test_db, run_pyhss_api
 
 log = logging.getLogger("UnitTestLogger")
 base_url = 'http://localhost:8080'

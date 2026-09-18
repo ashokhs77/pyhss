@@ -1,3 +1,6 @@
+#!/usr/bin/env python3
+# Copyright 2023-2025 David Kneipp <david@davidkneipp.com>
+# SPDX-License-Identifier: AGPL-3.0-or-later
 import os, sys, json, time, traceback, socket
 
 sys.path.append(os.path.realpath(os.path.dirname(__file__) + "/../lib"))
@@ -27,7 +30,15 @@ class HssService:
         self.originHost = config.get('hss', {}).get('OriginHost', f'hss01')
         self.productName = config.get('hss', {}).get('ProductName', f'PyHSS')
         self.logTool.log(service='HSS', level='info', message=f"{self.banners.hssService()}", redisClient=self.redisMessaging)
-        self.diameterLibrary = Diameter(logTool=self.logTool, originHost=self.originHost, originRealm=self.originRealm, productName=self.productName, mcc=self.mcc, mnc=self.mnc)
+        self.diameterLibrary = Diameter(
+            logTool=self.logTool,
+            originHost=self.originHost,
+            originRealm=self.originRealm,
+            productName=self.productName,
+            mcc=self.mcc,
+            mnc=self.mnc,
+            main_service=True,
+        )
         self.benchmarking = config.get('hss').get('enable_benchmarking', False)
         self.prometheusEnabled = config.get('prometheus', {}).get('enabled', False)
         self.emergencyCleanupInterval = int(config.get('hss', {}).get('emergency_cleanup_interval', 60))

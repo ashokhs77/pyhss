@@ -14,7 +14,7 @@ This includes support for acting as:
  - Generate BSF Credentials
  - Gateway Mobile Location Centre 
 
-Supported database backends include `MySQL`, `Postgresql`, `SQLite`, `Orcale`, `MS-SQL` and more, all provisioned through a Swagger based [RESTful API](docs/API.md) for easy, safe CRUD operations on the subscriber data.
+Supported database backends are `MySQL`, `PostgreSQL` and `SQLite`, all provisioned through a Swagger based [RESTful API](docs/API.md) for easy, safe CRUD operations on the subscriber data.
 
 The software supports full monitoring through `Prometheus`, and has been tested to over 1m subscribers.
 
@@ -119,6 +119,7 @@ PyHSS uses a queued microservices model. Each service performs a specific set of
 
 The following services make up PyHSS:
  - diameterService.py: Handles receiving and sending of diameter messages, and diameter client connection state.
+ - gsupService.py: Handles receiving and sending of GSUP messages to interact with 2G/3G Osmocom components.
  - hssService.py: Provides decoding and encoding of diameter requests and responses, as well as logic to perform as a HSS.
  - apiService.py: Provides the API, to allow management of PyHSS.
  - georedService.py: Sends georaphic redundancy messages to geored peers when defined. Also handles webhook messages.
@@ -157,6 +158,8 @@ python3 hssService.py
 python3 apiService.py
 ```
 
+By default these services bind to `127.0.0.1`; edit `bind_ip` in `config.yaml` if they need to be reachable from other hosts.
+
 All going well you'll have a functioning HSS at this point. For production use, systemd scripts are located in `./systemd`
 PyHSS API uses Flask, and can be configured with your favourite WSGI server.
 
@@ -187,3 +190,6 @@ It is now deployed by several mid-tier operators, private LTE networks and lab n
 Any contributions are welcome, just submit a PR or contact me.
 
 You can contact me at nick (at) nickvsnetworking.com or via my blog at [nickvsnetworking.com](https://nickvsnetworking.com)
+
+A matrix room for discussing PyHSS is available at:
+[#pyhss:matrix.org](https://matrix.to/#/#pyhss:matrix.org)
